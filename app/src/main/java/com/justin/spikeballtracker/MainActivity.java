@@ -3,6 +3,7 @@ package com.justin.spikeballtracker;
 import android.graphics.Bitmap;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.widget.Button;
@@ -11,6 +12,7 @@ import android.widget.ImageView;
 import androidx.activity.EdgeToEdge;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.annotation.RequiresApi;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
@@ -20,8 +22,11 @@ import org.opencv.android.OpenCVLoader;
 import org.opencv.android.Utils;
 import org.opencv.core.Mat;
 import org.opencv.imgproc.Imgproc;
+import org.opencv.video.BackgroundSubtractorMOG2;
+import org.opencv.video.Video;
 
 import java.io.IOException;
+import java.util.List;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -42,16 +47,7 @@ public class MainActivity extends AppCompatActivity {
                     Log.w(TAG, "No video selected");
                     return;
                 }
-                Log.d(TAG, "Video selected: " + uri);
-                Bitmap firstFrame = extractFirstFrame(uri);
-                if(firstFrame == null){
-                    Log.w(TAG, "Image might be unreadable");
-                    return;
-                }
-
-                Bitmap grayFrame = toGrayscale(firstFrame);
-                ImageView frameImageView = findViewById(R.id.frame_image_view);
-                frameImageView.setImageBitmap(grayFrame);
+                processVideo(uri);
             });
 
     private Bitmap extractFirstFrame(Uri videoUri){
@@ -77,6 +73,39 @@ public class MainActivity extends AppCompatActivity {
         }finally{
             sourceMat.release();
             grayMat.release();
+        }
+    }
+
+    private void processVideo(Uri videoUri){
+        List<Bitmap> frames;
+        int frameCount = 30;
+        Mat frameMat = new Mat();
+        Mat foregroundMask = new Mat();
+        Mat displayMat = new Mat();
+
+        try(MediaMetadataRetriever retriever = new MediaMetadataRetriever()){
+            retriever.setDataSource(this, videoUri);
+            frames = retriever.getFramesAtIndex(0, frameCount);
+
+            BackgroundSubtractorMOG2 subtractor = Video.createBackgroundSubtractorMOG2();
+            ImageView frameImageView = findViewById(R.id.frame_image_view);
+            for(Bitmap frame : frames){
+                Utils.bitmapToMat(frame, frameMat);
+                subtractor.apply(frameMat, foregroundMask);
+                Imgproc.cvtColor(foregroundMask, displayMat, Imgproc.COLOR_GRAY2RGBA);
+
+                Bitmap outputBitmap = Bitmap.createBitmap(frame.getWidth(), frame.getHeight(), Bitmap.Config.ARGB_8888);
+                Utils.matToBitmap(displayMat, outputBitmap);
+
+
+                frameImageView.setImageBitmap(outputBitmap);
+            }
+        } catch(IllegalArgumentException | IOException | SecurityException e) {
+            Log.e(TAG, "Video file not extracted correctly", e);
+        } finally{
+            frameMat.release();
+            foregroundMask.release();
+            displayMat.release();
         }
     }
 
