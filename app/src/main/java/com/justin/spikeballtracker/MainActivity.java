@@ -4,7 +4,6 @@ import android.graphics.Bitmap;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.FileUriExposedException;
 import android.util.Log;
 import android.widget.Button;
 import android.widget.ImageView;
@@ -18,6 +17,9 @@ import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
 import org.opencv.android.OpenCVLoader;
+import org.opencv.android.Utils;
+import org.opencv.core.Mat;
+import org.opencv.imgproc.Imgproc;
 
 import java.io.IOException;
 
@@ -46,8 +48,10 @@ public class MainActivity extends AppCompatActivity {
                     Log.w(TAG, "Image might be unreadable");
                     return;
                 }
+
+                Bitmap grayFrame = toGrayscale(firstFrame);
                 ImageView frameImageView = findViewById(R.id.frame_image_view);
-                frameImageView.setImageBitmap(firstFrame);
+                frameImageView.setImageBitmap(grayFrame);
             });
 
     private Bitmap extractFirstFrame(Uri videoUri){
@@ -59,6 +63,21 @@ public class MainActivity extends AppCompatActivity {
             Log.e(TAG, "Image could not be extracted", e);
         }
         return null;
+    }
+
+    private Bitmap toGrayscale(Bitmap source){
+        Mat sourceMat = new Mat();
+        Mat grayMat = new Mat();
+        try{
+            Utils.bitmapToMat(source, sourceMat);
+            Imgproc.cvtColor(sourceMat, grayMat, Imgproc.COLOR_RGBA2GRAY);
+            Bitmap outputBitmap = Bitmap.createBitmap(source.getWidth(), source.getHeight(), Bitmap.Config.ARGB_8888);
+            Utils.matToBitmap(grayMat, outputBitmap);
+            return outputBitmap;
+        }finally{
+            sourceMat.release();
+            grayMat.release();
+        }
     }
 
     @Override
