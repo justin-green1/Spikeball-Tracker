@@ -10,11 +10,20 @@ import org.opencv.video.Video;
 
 public class MotionDetector {
 
+    private static final String TAG = "Motiondetector";
     private final BackgroundSubtractorMOG2 subtractor;
     private final Mat frameMat;
     private final Mat foregroundMask;
     private final Mat displayMat;
 
+    /**
+     * Performs MOG2 background subtraction on a sequence of video frames.
+     *
+     * <p>Maintains a statistical background model across calls to
+     * {@link #processFrame(Bitmap)}, so a single instance must be reused for
+     * all frames of a video. Callers must invoke {@link #release()} when
+     * finished to free native OpenCV resources.
+     */
     public MotionDetector(){
         this.subtractor = Video.createBackgroundSubtractorMOG2();
         this.frameMat = new Mat();
@@ -22,6 +31,12 @@ public class MotionDetector {
         this.displayMat = new Mat();
     }
 
+    /**
+     * Applies MOG2 background subtraction to the frame
+     *
+     * @param frame video frame which background subtraction is applied to
+     * @return output frame which has had background subtraction performed on it as Bitmap.
+     */
     public Bitmap processFrame(Bitmap frame){
 
         Utils.bitmapToMat(frame, frameMat);
@@ -34,6 +49,9 @@ public class MotionDetector {
         return outputBitmap;
     }
 
+    /**
+     * releases all object fields
+     */
     public void release() {
         this.frameMat.release();
         this.foregroundMask.release();
