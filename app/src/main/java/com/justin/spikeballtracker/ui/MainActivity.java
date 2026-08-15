@@ -60,31 +60,22 @@ public class MainActivity extends AppCompatActivity {
         ImageView frameImageView = findViewById(R.id.frame_image_view);
 
         processingExecutor.execute(() -> {
-            List<Bitmap> frames = frameExtractor.extractFrames(videoUri, FRAME_COUNT);
-            if (frames == null) {
-                Log.w(TAG, "No frames extracted from " + videoUri);
-                return;
-            }
-
             MotionDetector motionDetector = new MotionDetector();
-            Mat sourceMat = new Mat();
             Mat grayMat = new Mat();
 
             try {
-                for (Bitmap sourceFrame : frames) {
-                    Utils.bitmapToMat(sourceFrame, sourceMat);
-                    Imgproc.cvtColor(sourceMat, grayMat, Imgproc.COLOR_RGBA2GRAY);
+                frameExtractor.streamFrames(videoUri, (frame, timestampMs) -> {
+                    Imgproc.cvtColor(frame, grayMat, Imgproc.COLOR_RGBA2GRAY);
 
-                    // Owned by motionDetector — do not release, and do not hold
-                    // beyond this iteration; the next processFrame call overwrites it.
+                    // Owned by motionDetector — do not release, and do not hold beyond
+                    // this callback; the next processFrame call overwrites it.
                     Mat foregroundMask = motionDetector.processFrame(grayMat);
 
                     // Allocated per frame rather than reused: the UI thread may still be
                     // drawing the previous bitmap when the next frame is written.
-                    // Costs one allocation per frame; revisit if GC pressure shows up.
                     Bitmap maskBitmap = Bitmap.createBitmap(
-                            sourceFrame.getWidth(),
-                            sourceFrame.getHeight(),
+                            foregroundMask.cols(),
+                            foregroundMask.rows(),
                             Bitmap.Config.ARGB_8888);
                     Utils.matToBitmap(foregroundMask, maskBitmap);
 
@@ -94,11 +85,11 @@ public class MainActivity extends AppCompatActivity {
                         Thread.sleep(FRAME_DELAY_MS);
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
-                        return;
+                        return false;   // stop streaming
                     }
-                }
+                    return true;        // keep going
+                });
             } finally {
-                sourceMat.release();
                 grayMat.release();
                 motionDetector.release();
             }

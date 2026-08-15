@@ -1,10 +1,6 @@
 package com.justin.spikeballtracker.vision;
 
-import android.graphics.Bitmap;
-
-import org.opencv.android.Utils;
 import org.opencv.core.Mat;
-import org.opencv.imgproc.Imgproc;
 import org.opencv.video.BackgroundSubtractorKNN;
 import org.opencv.video.BackgroundSubtractorMOG2;
 import org.opencv.video.Video;
