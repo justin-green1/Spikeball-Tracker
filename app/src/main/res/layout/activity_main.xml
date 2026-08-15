@@ -27,7 +27,8 @@
         tools:layout_editor_absoluteY="389dp"
         tools:srcCompat="@tools:sample/avatars"
         app:layout_constraintTop_toBottomOf="@id/select_video_button"
-        tools:ignore="MissingConstraints"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
         android:contentDescription="@string/image_content_description"/>
 
 
