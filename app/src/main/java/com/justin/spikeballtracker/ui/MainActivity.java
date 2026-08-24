@@ -1,6 +1,7 @@
 package com.justin.spikeballtracker.ui;
 
 import android.graphics.Bitmap;
+
 import android.net.Uri;
 import android.os.Bundle;
 import android.util.Log;
@@ -17,23 +18,24 @@ import androidx.core.view.WindowInsetsCompat;
 
 import com.justin.spikeballtracker.R;
 import com.justin.spikeballtracker.video.FrameExtractor;
+import com.justin.spikeballtracker.vision.ColourDetector;
 import com.justin.spikeballtracker.vision.MotionDetector;
 
 import org.opencv.android.OpenCVLoader;
 import org.opencv.android.Utils;
+import org.opencv.core.Core;
+import org.opencv.core.CvType;
 import org.opencv.core.Mat;
-import org.opencv.imgproc.Imgproc;
+import org.opencv.core.Scalar;
 
-import java.util.List;
+import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "MainActivity";
-    private static final int FRAME_COUNT = 90;
     private static final int FRAME_DELAY_MS = 33;
-
     private FrameExtractor frameExtractor;
     private final ExecutorService processingExecutor = Executors.newSingleThreadExecutor();
 
@@ -61,24 +63,36 @@ public class MainActivity extends AppCompatActivity {
 
         processingExecutor.execute(() -> {
             MotionDetector motionDetector = new MotionDetector();
-            Mat grayMat = new Mat();
+            ColourDetector colourDetector = new ColourDetector();
+            Mat foregroundMask = new Mat();
+            Mat zeros = new Mat();
+
 
             try {
                 frameExtractor.streamFrames(videoUri, (frame, timestampMs) -> {
-                    Imgproc.cvtColor(frame, grayMat, Imgproc.COLOR_RGBA2GRAY);
-
                     // Owned by motionDetector — do not release, and do not hold beyond
                     // this callback; the next processFrame call overwrites it.
-                    Mat foregroundMask = motionDetector.processFrame(grayMat);
+                    Mat motionMask = motionDetector.processFrame(frame);
+                    Mat colourMask = colourDetector.processFrame(frame);
+                    if (zeros.empty()) {
+                        zeros.create(motionMask.size(), CvType.CV_8UC1);
+                        zeros.setTo(new Scalar(0));
+                    }
 
                     // Allocated per frame rather than reused: the UI thread may still be
                     // drawing the previous bitmap when the next frame is written.
-                    Bitmap maskBitmap = Bitmap.createBitmap(
-                            foregroundMask.cols(),
-                            foregroundMask.rows(),
-                            Bitmap.Config.ARGB_8888);
-                    Utils.matToBitmap(foregroundMask, maskBitmap);
+                    Core.merge(Arrays.asList(colourMask, motionMask, zeros), foregroundMask);
+                    //Scalar lowerBound = new Scalar(255,  255, 0);
+                    //Scalar upperBound = new Scalar(255, 255, 255);
+                    //Core.inRange(foregroundMask, lowerBound, upperBound, colourMask);
 
+
+                    Bitmap maskBitmap = Bitmap.createBitmap(
+                            colourMask.cols(),
+                            colourMask.rows(),
+                            Bitmap.Config.ARGB_8888);
+                    //Utils.matToBitmap(colourMask, maskBitmap);
+                    Utils.matToBitmap(foregroundMask, maskBitmap);
                     runOnUiThread(() -> frameImageView.setImageBitmap(maskBitmap));
 
                     try {
@@ -90,11 +104,15 @@ public class MainActivity extends AppCompatActivity {
                     return true;        // keep going
                 });
             } finally {
-                grayMat.release();
                 motionDetector.release();
+                colourDetector.release();
+                frameExtractor.release();
+                foregroundMask.release();
+                zeros.release();
             }
         });
     }
+
 
     @Override
     protected void onDestroy() {
