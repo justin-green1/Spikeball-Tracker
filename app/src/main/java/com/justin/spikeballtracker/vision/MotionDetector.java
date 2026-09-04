@@ -13,15 +13,15 @@ public class MotionDetector {
 
     private static final String TAG = "MotionDetector";
     private final BackgroundSubtractorKNN subtractor;
-    private static final int HISTORY = 80;
+    private static final int HISTORY = 300;
     private static final double DIST_2_THRESHOLD = 100;
-    private static final boolean DETECT_SHADOWS = true;
+    private static final boolean DETECT_SHADOWS = false;
     private static final Size BLUR_KERNEL = new Size(9, 9);
     private final Mat blurredFrame;
     private final Mat foregroundMask;
 
     /**
-     * Performs MOG2 background subtraction on a sequence of video frames.
+     * Performs KNN background subtraction on a sequence of video frames.
      *
      * <p>Maintains a statistical background model across calls to
      * {@link #processFrame(Mat)}, so a single instance must be reused for
@@ -47,11 +47,16 @@ public class MotionDetector {
         return foregroundMask;
     }
 
+    public void getBackgroundImage(Mat background) {
+        subtractor.getBackgroundImage(background);
+    }
+
     /**
      * releases all object fields
      */
     public void release() {
         this.foregroundMask.release();
         this.subtractor.clear();
+        this.blurredFrame.release();
     }
 }

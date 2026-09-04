@@ -17,6 +17,8 @@ import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
 import com.justin.spikeballtracker.R;
+import com.justin.spikeballtracker.tracking.BallCandidate;
+import com.justin.spikeballtracker.vision.BlobDetector;
 import com.justin.spikeballtracker.video.FrameExtractor;
 import com.justin.spikeballtracker.vision.ColourDetector;
 import com.justin.spikeballtracker.vision.MotionDetector;
@@ -24,17 +26,21 @@ import com.justin.spikeballtracker.vision.MotionDetector;
 import org.opencv.android.OpenCVLoader;
 import org.opencv.android.Utils;
 import org.opencv.core.Core;
-import org.opencv.core.CvType;
 import org.opencv.core.Mat;
 import org.opencv.core.Scalar;
 
-import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import org.opencv.core.Point;
+import org.opencv.imgproc.Imgproc;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "MainActivity";
+    private static final Scalar MARKER_COLOUR = new Scalar(255, 0, 0);
     private static final int FRAME_DELAY_MS = 33;
     private FrameExtractor frameExtractor;
     private final ExecutorService processingExecutor = Executors.newSingleThreadExecutor();
@@ -64,60 +70,65 @@ public class MainActivity extends AppCompatActivity {
         processingExecutor.execute(() -> {
             MotionDetector motionDetector = new MotionDetector();
             ColourDetector colourDetector = new ColourDetector();
-            Mat foregroundMask = new Mat();
-            Mat zeros = new Mat();
+            BlobDetector blobDetector = new BlobDetector();
 
+            Mat ballMask = new Mat();     // single channel, input to blob detection
+            Mat displayMat = new Mat();   // RGB copy of the frame, drawn on
+
+            // A lambda can't mutate a captured local, but it can mutate the object
+            // a captured reference points at. Hence AtomicInteger rather than int.
+            AtomicInteger frameCounter = new AtomicInteger();
+            List<BallCandidate> allCandidates = new ArrayList<>();
 
             try {
-                frameExtractor.streamFrames(videoUri, (frame, timestampMs) -> {
-                    // Owned by motionDetector — do not release, and do not hold beyond
-                    // this callback; the next processFrame call overwrites it.
+                frameExtractor.streamFrames(videoUri, (frame, timestampUs) -> {
+                    int frameIndex = frameCounter.getAndIncrement();
+
                     Mat motionMask = motionDetector.processFrame(frame);
                     Mat colourMask = colourDetector.processFrame(frame);
-                    if (zeros.empty()) {
-                        zeros.create(motionMask.size(), CvType.CV_8UC1);
-                        zeros.setTo(new Scalar(0));
+
+                    Core.bitwise_and(colourMask, motionMask, ballMask);
+
+                    List<BallCandidate> candidates =
+                            blobDetector.findCandidates(ballMask, frameIndex, timestampUs);
+                    allCandidates.addAll(candidates);
+
+                    // Debug view: original footage with a ring round each candidate.
+                    // Ring rather than filled dot so you can see whether it's
+                    // actually centred on the ball.
+                    Imgproc.cvtColor(frame, displayMat, Imgproc.COLOR_YUV2RGB);
+                    for (BallCandidate c : candidates) {
+                        Imgproc.circle(displayMat, new Point(c.x, c.y), 12, MARKER_COLOUR, 2);
                     }
 
-                    // Allocated per frame rather than reused: the UI thread may still be
-                    // drawing the previous bitmap when the next frame is written.
-                    Core.merge(Arrays.asList(colourMask, motionMask, zeros), foregroundMask);
-                    //Scalar lowerBound = new Scalar(255,  255, 0);
-                    //Scalar upperBound = new Scalar(255, 255, 255);
-                    //Core.inRange(foregroundMask, lowerBound, upperBound, colourMask);
-
-
-                    Bitmap maskBitmap = Bitmap.createBitmap(
-                            colourMask.cols(),
-                            colourMask.rows(),
-                            Bitmap.Config.ARGB_8888);
-                    //Utils.matToBitmap(colourMask, maskBitmap);
-                    Utils.matToBitmap(foregroundMask, maskBitmap);
-                    runOnUiThread(() -> frameImageView.setImageBitmap(maskBitmap));
+                    Bitmap bitmap = Bitmap.createBitmap(
+                            displayMat.cols(), displayMat.rows(), Bitmap.Config.ARGB_8888);
+                    Utils.matToBitmap(displayMat, bitmap);
+                    runOnUiThread(() -> frameImageView.setImageBitmap(bitmap));
 
                     try {
                         Thread.sleep(FRAME_DELAY_MS);
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
-                        return false;   // stop streaming
+                        return false;
                     }
-                    return true;        // keep going
+                    return true;
                 });
             } finally {
+                Log.d(TAG, "total candidates: " + allCandidates.size());
                 motionDetector.release();
                 colourDetector.release();
-                frameExtractor.release();
-                foregroundMask.release();
-                zeros.release();
+                blobDetector.release();
+                ballMask.release();
+                displayMat.release();
             }
         });
     }
 
-
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        processingExecutor.shutdown();
+        processingExecutor.shutdownNow();
     }
 
     @Override

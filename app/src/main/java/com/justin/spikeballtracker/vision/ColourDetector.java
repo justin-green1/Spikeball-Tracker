@@ -12,11 +12,11 @@ public class ColourDetector {
 
     public ColourDetector(){
         this.colourMask = new Mat();
-        this.lowerBound = new Scalar(100, 35, 155);
-        this.upperBound = new Scalar(200, 88, 209);
+        this.lowerBound = new Scalar(0, 30, 148);
+        this.upperBound = new Scalar(255, 94, 185);
     }
 
-    public Mat processFrame(Mat Frame){
+    public Mat processFrame(Mat Frame) {
         Core.inRange(Frame, lowerBound, upperBound, colourMask);
         return colourMask;
     }
