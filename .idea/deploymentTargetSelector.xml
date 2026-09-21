@@ -3,11 +3,11 @@
   <component name="deploymentTargetSelector">
     <selectionStates>
       <SelectionState runConfigName="app">
-        <option name="selectionMode" value="DIALOG" />
-        <DropdownSelection timestamp="2026-08-24T13:45:41.176116500Z">
+        <option name="selectionMode" value="DROPDOWN" />
+        <DropdownSelection timestamp="2026-09-20T12:22:44.314455300Z">
           <Target type="DEFAULT_BOOT">
             <handle>
-              <DeviceId pluginId="PhysicalDevice" identifier="serial=RZCXC0GK76J" />
+              <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\justi\.android\avd\Pixel_10a.avd" />
             </handle>
           </Target>
         </DropdownSelection>
@@ -15,12 +15,12 @@
           <targets>
             <Target type="DEFAULT_BOOT">
               <handle>
-                <DeviceId pluginId="PhysicalDevice" identifier="serial=RZCXC0GK76J" />
+                <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\justi\.android\avd\Pixel_10a.avd" />
               </handle>
             </Target>
             <Target type="DEFAULT_BOOT">
               <handle>
-                <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\justi\.android\avd\Pixel_10a.avd" />
+                <DeviceId pluginId="PhysicalDevice" identifier="serial=RZCXC0GK76J" />
               </handle>
             </Target>
           </targets>

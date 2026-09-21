@@ -34,5 +34,50 @@
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent" />
 
+    <Button
+        android:id="@+id/select_photo_button"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:minWidth="0dp"
+        android:minHeight="0dp"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="6dp"
+        android:text="@string/select_photo_button_text"
+        android:textSize="12sp"
+        app:layout_constraintTop_toTopOf="@id/select_video_button"
+        app:layout_constraintStart_toEndOf="@id/select_video_button" />
+
+    <Button
+        android:id="@+id/stop_video_button"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:minWidth="0dp"
+        android:minHeight="0dp"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="6dp"
+        android:text="@string/stop_video_button_text"
+        android:textSize="12sp"
+        app:layout_constraintTop_toTopOf="@id/select_photo_button"
+        app:layout_constraintStart_toEndOf="@id/select_photo_button" />
+
+    <Button
+        android:id="@+id/export_background_button"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:minWidth="0dp"
+        android:minHeight="0dp"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="6dp"
+        android:text="@string/export_background_button_text"
+        android:textSize="12sp"
+        app:layout_constraintTop_toTopOf="@id/stop_video_button"
+        app:layout_constraintStart_toEndOf="@id/stop_video_button" />
+
+
+
+
 
 </androidx.constraintlayout.widget.ConstraintLayout>

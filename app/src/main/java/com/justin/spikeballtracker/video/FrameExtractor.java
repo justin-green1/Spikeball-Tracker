@@ -1,12 +1,15 @@
 package com.justin.spikeballtracker.video;
 
 import android.content.Context;
+import android.graphics.Rect;
 import android.media.Image;
 import android.media.MediaCodec;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.net.Uri;
+import android.os.Build;
 import android.util.Log;
+
 
 import org.opencv.core.Core;
 import org.opencv.core.CvType;
@@ -27,12 +30,65 @@ public class FrameExtractor {
     private final Mat uPacked = new Mat();
     private final Mat vPacked = new Mat();
     private final Mat yuvMat;
+    private int frameIndex = 0;
+
+    // What the container claims about colour, read once per stream.
+    private volatile String mime = "unknown";
+    private volatile String colourRange = "undeclared";
+    private volatile String colourStandard = "unknown";
+
+    /**
+     * True when the decoder's samples are limited range and must be expanded.
+     * Undeclared footage is treated as limited, which is the convention for
+     * H.264 and what phone cameras produce.
+     */
+    private volatile boolean expandToFullRange = true;
+
+    /** Channel-wise 16-235 / 16-240 to 0-255 map, built once. */
+    private final Mat fullRangeLut = buildFullRangeLut();
+
 
     public FrameExtractor(Context context) {
         this.context = context.getApplicationContext();
         this.resizedUMat = new Mat();
         this.resizedVMat = new Mat();
         this.yuvMat = new Mat();
+    }
+
+    /**
+     * An immutable snapshot of what the current stream declared about colour.
+     *
+     * <p>The fields it copies live on this long-lived extractor and are reset
+     * per stream; taking a snapshot means a caller cannot accidentally read a
+     * previous video's metadata, which is the failure mode that made an
+     * untagged file report as limited bt709.
+     */
+    public static final class ColourInfo {
+        public final String mime;
+        public final String range;
+        public final String standard;
+        public final boolean expandToFullRange;
+
+        ColourInfo(String mime, String range, String standard, boolean expandToFullRange) {
+            this.mime = mime;
+            this.range = range;
+            this.standard = standard;
+            this.expandToFullRange = expandToFullRange;
+        }
+
+        @Override
+        public String toString() {
+            return "mime=" + mime + " range=" + range + " standard=" + standard
+                    + " expandToFullRange=" + expandToFullRange;
+        }
+    }
+
+    /**
+     * What the current stream declared. Valid once decoding has begun; the
+     * fields are set by readColourInfo before the first frame is delivered.
+     */
+    public ColourInfo colourInfo() {
+        return new ColourInfo(mime, colourRange, colourStandard, expandToFullRange);
     }
 
     public interface FrameListener {
@@ -75,6 +131,14 @@ public class FrameExtractor {
             MediaFormat format = extractor.getTrackFormat(trackIndex);
             Log.d(TAG, "video format: " + format);
 
+            readColourInfo(format);
+            Log.d(TAG, "colour: mime=" + mime
+                    + " range=" + colourRange
+                    + " standard=" + colourStandard
+                    + " -> " + (expandToFullRange
+                            ? "expanding to full range"
+                            : "already full range, passing through"));
+
             codec = createDecoder(format);
             decodeLoop(extractor, codec, listener);
 
@@ -84,6 +148,85 @@ public class FrameExtractor {
             release(codec, extractor);
             releaseScratch();
         }
+    }
+
+    /**
+     * Records what the container claims about colour range and primaries.
+     *
+     * <p>Both keys are optional and frequently absent on consumer footage; an
+     * undeclared range conventionally means limited (16-235), but this method
+     * reports "undeclared" rather than assuming, so callers can decide.
+     */
+    private void readColourInfo(MediaFormat format) {
+        // Reset first. These fields outlive a single stream, and the keys below
+        // are optional, so without this an untagged video silently inherits the
+        // colour metadata of whichever video was opened before it.
+        mime = "unknown";
+        colourRange = "undeclared";
+        colourStandard = "unknown";
+        expandToFullRange = true;
+
+        mime = format.getString(MediaFormat.KEY_MIME);
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            return;   // the colour keys did not exist before API 24
+        }
+
+        if (format.containsKey(MediaFormat.KEY_COLOR_RANGE)) {
+            int range = format.getInteger(MediaFormat.KEY_COLOR_RANGE);
+            if (range == MediaFormat.COLOR_RANGE_FULL) {
+                colourRange = "full";
+                expandToFullRange = false;   // already 0-255, expanding would clip
+            } else if (range == MediaFormat.COLOR_RANGE_LIMITED) {
+                colourRange = "limited";
+            } else {
+                colourRange = "unknown(" + range + ")";
+            }
+        }
+
+        if (format.containsKey(MediaFormat.KEY_COLOR_STANDARD)) {
+            int std = format.getInteger(MediaFormat.KEY_COLOR_STANDARD);
+            if (std == MediaFormat.COLOR_STANDARD_BT709) {
+                colourStandard = "bt709";
+            } else if (std == MediaFormat.COLOR_STANDARD_BT601_PAL
+                    || std == MediaFormat.COLOR_STANDARD_BT601_NTSC) {
+                colourStandard = "bt601";
+            } else if (std == MediaFormat.COLOR_STANDARD_BT2020) {
+                colourStandard = "bt2020";
+            } else {
+                colourStandard = "unknown(" + std + ")";
+            }
+        }
+    }
+
+    /**
+     * Builds the lookup table that maps limited-range samples to full range.
+     *
+     * <p>Luma and chroma use different conventions: luma occupies 16-235 and
+     * expands about its floor, chroma occupies 16-240 and expands about its
+     * neutral point of 128. A single 3-channel LUT applies both in one pass,
+     * which is far cheaper per frame than splitting and merging channels.
+     *
+     * @return a 1x256 CV_8UC3 table, channels in Y, U, V order
+     */
+    private static Mat buildFullRangeLut() {
+        Mat lut = new Mat(1, 256, CvType.CV_8UC3);
+        byte[] table = new byte[256 * 3];
+
+        for (int i = 0; i < 256; i++) {
+            int y = clampByte((int) Math.round((i - 16) * 255.0 / 219.0));
+            int c = clampByte((int) Math.round((i - 128) * 255.0 / 224.0 + 128));
+            table[i * 3] = (byte) y;
+            table[i * 3 + 1] = (byte) c;
+            table[i * 3 + 2] = (byte) c;
+        }
+
+        lut.put(0, 0, table);
+        return lut;
+    }
+
+    private static int clampByte(int v) {
+        return v < 0 ? 0 : (v > 255 ? 255 : v);
     }
 
     /** Returns the index of the first video track, or -1 if there is none. */
@@ -219,6 +362,7 @@ public class FrameExtractor {
 
         Mat uSrc = null;
         Mat vSrc = null;
+
         try {
             if (uPlane.getPixelStride() == 2) {
                 // Semi-planar. Each plane's buffer starts on its own component,
@@ -255,6 +399,14 @@ public class FrameExtractor {
 
         Imgproc.resize(yuvMat, yuvMat, new Size(854, 480), 0, 0, Imgproc.INTER_AREA);
 
+        // Put every consumer in the same numeric space as a decoded photo, so a
+        // threshold means the same thing whichever path produced the pixels.
+        // Applied after the resize, on fewer pixels, and before any consumer
+        // sees the frame.
+        if (expandToFullRange) {
+            Core.LUT(yuvMat, fullRangeLut, yuvMat);
+        }
+
         return yuvMat;
     }
 
@@ -265,5 +417,13 @@ public class FrameExtractor {
         resizedUMat.release();
         resizedVMat.release();
         yuvMat.release();
+    }
+
+    /**
+     * Frees resources held for the lifetime of this extractor, as opposed to
+     * the per-stream scratch buffers. Call from the owner's onDestroy.
+     */
+    public void release() {
+        fullRangeLut.release();
     }
 }

@@ -13,9 +13,9 @@ public class MotionDetector {
 
     private static final String TAG = "MotionDetector";
     private final BackgroundSubtractorKNN subtractor;
-    private static final int HISTORY = 300;
+    private static final int HISTORY = 8000;
     private static final double DIST_2_THRESHOLD = 100;
-    private static final boolean DETECT_SHADOWS = false;
+    private static final boolean DETECT_SHADOWS = true;
     private static final Size BLUR_KERNEL = new Size(9, 9);
     private final Mat blurredFrame;
     private final Mat foregroundMask;
@@ -45,6 +45,27 @@ public class MotionDetector {
         Imgproc.GaussianBlur(frame, blurredFrame, BLUR_KERNEL, 0);
         subtractor.apply(blurredFrame, foregroundMask);
         return foregroundMask;
+    }
+
+    /**
+     * The KNN settings in force. Exposed so a run's provenance can be recorded
+     * alongside exported frames, and so offline work can rebuild the same model.
+     */
+    public static int history() {
+        return HISTORY;
+    }
+
+    public static double dist2Threshold() {
+        return DIST_2_THRESHOLD;
+    }
+
+    public static boolean detectShadows() {
+        return DETECT_SHADOWS;
+    }
+
+    /** Width of the Gaussian kernel applied before every subtractor.apply. */
+    public static int preBlurKernel() {
+        return (int) BLUR_KERNEL.width;
     }
 
     public void getBackgroundImage(Mat background) {

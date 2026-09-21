@@ -8,13 +8,20 @@ public final class BallCandidate {
     public final double x;
     public final double y;
     public final int area;
-
-    public BallCandidate(int frameIndex, long timestampUs, double x, double y, int area) {
+    double left;
+    double top;
+    double width;
+    double height;
+    public BallCandidate(int frameIndex, long timestampUs, double x, double y, int area, double left, double top, double width, double height) {
         this.frameIndex = frameIndex;
         this.timestampUs = timestampUs;
         this.x = x;
         this.y = y;
         this.area = area;
+        this.left = left;
+        this.top = top;
+        this.width = width;
+        this.height = height;
     }
 
     @Override
