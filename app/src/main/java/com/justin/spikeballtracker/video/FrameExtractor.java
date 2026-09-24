@@ -30,7 +30,7 @@ public class FrameExtractor {
     private volatile String mime = "unknown";
     private volatile String colourRange = "undeclared";
     private volatile String colourStandard = "unknown";
-    private static final Size TARGET_SIZE = new Size(854, 480);
+    public static final Size TARGET_SIZE = new Size(854, 480);
 
     /**
      * True when the decoder's samples are limited range and must be expanded.

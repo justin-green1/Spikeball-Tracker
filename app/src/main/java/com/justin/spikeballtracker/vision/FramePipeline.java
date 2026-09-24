@@ -12,6 +12,7 @@ import org.opencv.core.Scalar;
 import org.opencv.imgproc.Imgproc;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * One frame of the detection pipeline, shared by the recorded-video path and
@@ -32,8 +33,8 @@ public final class FramePipeline {
     private static final Scalar MARKER_COLOUR      = new Scalar(255, 0, 0);
     private static final Scalar NET_OVERLAY_COLOUR = new Scalar(0, 255, 255);
 
-    private static final long INITIAL_NET_DELAY_US          = 10_000_000L;
-    private static final long NET_RECALIBRATION_INTERVAL_US =  5_000_000L;
+    private final AtomicBoolean resetRequested = new AtomicBoolean(false);
+    private long warmStartUs = 0L;
 
     public static final class Result {
         public final int frameIndex;
@@ -64,8 +65,6 @@ public final class FramePipeline {
     private final Mat ballMask   = new Mat();
     private final Mat background = new Mat();
 
-    private Rect cachedNetBox    = null;
-    private long lastNetUpdateUs = -1L;
     private int  frameIndex      = 0;
 
     /**
@@ -77,6 +76,13 @@ public final class FramePipeline {
      */
     public Result process(Mat yuv, long timestampUs, Mat displayOut, boolean plateWanted) {
         int index = frameIndex++;
+
+        if (index == 0) {
+            warmStartUs = timestampUs;
+        }
+        if (resetRequested.getAndSet(false)) {
+            applyReset(timestampUs);
+        }
 
         Mat motionMask = motionDetector.processFrame(yuv);
         Mat colourMask = colourDetector.processFrame(yuv);
@@ -100,31 +106,49 @@ public final class FramePipeline {
         return new Result(index, candidates, cachedNetBox, plate);
     }
 
-    private Mat updateNet(long timestampUs, boolean plateWanted) {
-        boolean needsInitialLock =
-                (cachedNetBox == null && timestampUs > INITIAL_NET_DELAY_US);
-        boolean needsRecalibration =
-                (cachedNetBox != null
-                        && timestampUs - lastNetUpdateUs >= NET_RECALIBRATION_INTERVAL_US);
+    private static final long NET_WARMUP_US           = 10_000_000L;
+    private static final long NET_ATTEMPT_INTERVAL_US =  5_000_000L;
 
-        if (!needsInitialLock && !needsRecalibration && !plateWanted) {
-            return null;
+    private Rect cachedNetBox = null;
+
+    /**
+     * When a detect was last attempted, successful or not. This gates the cost,
+     * so a failure has to move it too — otherwise a scene the detector cannot
+     * solve makes it retry on every single frame.
+     *
+     * <p>Starts one interval in the past, meaning "due as soon as warm".
+     */
+    private long lastNetAttemptUs = -NET_ATTEMPT_INTERVAL_US;
+
+    private Mat updateNet(long timestampUs, boolean plateWanted) {
+        boolean detectDue =
+                timestampUs - warmStartUs >= NET_WARMUP_US
+                        && timestampUs - lastNetAttemptUs >= NET_ATTEMPT_INTERVAL_US;
+
+        if (!detectDue && !plateWanted) {
+            return null;   // nothing needs a plate this frame
         }
 
         try {
             motionDetector.getBackgroundImage(background);
             if (background.empty()) {
-                return null;   // model not warm yet; try again next frame
+                return null;   // model has nothing yet; don't burn the attempt on it
             }
 
-            if (needsInitialLock || needsRecalibration) {
+            if (detectDue) {
+                // Stamped *before* the call, so a null result or a throw costs the
+                // same interval as a success.
+                lastNetAttemptUs = timestampUs;
+
                 NetDetector.NetResult result =
                         netDetector.detect(background, NetDetector.ColourSpace.YUV);
+
                 if (result != null && result.box != null) {
                     cachedNetBox = result.box;
-                    lastNetUpdateUs = timestampUs;
-                    Log.d(TAG, (needsInitialLock ? "initial net lock: " : "net recalibrated: ")
-                            + cachedNetBox);
+                    Log.d(TAG, "net locked: " + cachedNetBox);
+                } else {
+                    Log.d(TAG, "no net in this plate; next attempt in "
+                            + (NET_ATTEMPT_INTERVAL_US / 1_000_000L) + "s");
                 }
             }
             return background;
@@ -132,6 +156,18 @@ public final class FramePipeline {
             Log.e(TAG, "net update failed", e);
             return null;
         }
+    }
+
+    public void requestReset() {
+        resetRequested.set(true);
+    }
+
+    private void applyReset(long timestampUs) {
+        motionDetector.reset();
+        cachedNetBox = null;              // the old box describes the old framing
+        warmStartUs = timestampUs;        // warm-up counts from here, not from run start
+        lastNetAttemptUs = timestampUs - NET_ATTEMPT_INTERVAL_US;   // due the moment it is warm
+        Log.d(TAG, "background reset; net cleared, warm-up restarts");
     }
 
     public void release() {

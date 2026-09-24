@@ -6,5 +6,6 @@
     <string name="stop_video_button_text">Stop Video</string>
     <string name="export_background_button_text">Export BG</string>
     <string name="open_camera_button_text">Open Camera</string>
+    <string name="clear_background_button_text">Clear</string>
 
 </resources>

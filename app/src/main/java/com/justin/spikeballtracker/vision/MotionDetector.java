@@ -12,7 +12,7 @@ import org.opencv.video.Video;
 public class MotionDetector {
 
     private static final String TAG = "MotionDetector";
-    private final BackgroundSubtractorKNN subtractor;
+    private BackgroundSubtractorKNN subtractor;
     private static final int HISTORY = 3600;
     private static final double DIST_2_THRESHOLD = 100;
     private static final boolean DETECT_SHADOWS = true;
@@ -29,10 +29,13 @@ public class MotionDetector {
      * finished to free native OpenCV resources.
      */
     public MotionDetector(){
-        this.subtractor = Video.createBackgroundSubtractorKNN(
-                HISTORY, DIST_2_THRESHOLD, DETECT_SHADOWS);
+        this.subtractor = newSubtractor();
         this.foregroundMask = new Mat();
         this.blurredFrame = new Mat();
+    }
+
+    private static BackgroundSubtractorKNN newSubtractor() {
+        return Video.createBackgroundSubtractorKNN(HISTORY, DIST_2_THRESHOLD, DETECT_SHADOWS);
     }
 
     /**
@@ -70,6 +73,21 @@ public class MotionDetector {
 
     public void getBackgroundImage(Mat background) {
         subtractor.getBackgroundImage(background);
+    }
+
+    /**
+     * Throws the learned background away and starts a fresh model.
+     *
+     * <p>Needed when the camera moves: every pixel's history then describes a
+     * scene that is no longer in front of the lens, and with HISTORY frames of
+     * evidence behind it the model would take that long to forget on its own.
+     *
+     * <p>The subtractor is replaced rather than cleared, because OpenCV's
+     * Algorithm.clear() does not reset KNN's sample history — only a new
+     * instance does. The old one is freed once nothing references it.
+     */
+    public void reset() {
+        this.subtractor = newSubtractor();
     }
 
     /**
