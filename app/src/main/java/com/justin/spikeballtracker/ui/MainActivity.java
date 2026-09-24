@@ -3,27 +3,43 @@ package com.justin.spikeballtracker.ui;
 import android.graphics.Bitmap;
 
 import android.graphics.ImageDecoder;
+import android.media.Image;
 import android.net.Uri;
 import android.os.Bundle;
 import android.util.Log;
 import android.widget.Button;
 import android.widget.ImageView;
+import android.Manifest;
+import android.content.pm.PackageManager;
 
 import androidx.activity.EdgeToEdge;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.PickVisualMediaRequest;
 import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.annotation.OptIn;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.camera.core.ExperimentalGetImage;
+import androidx.camera.core.resolutionselector.AspectRatioStrategy;
+import androidx.camera.core.resolutionselector.ResolutionSelector;
+import androidx.camera.core.resolutionselector.ResolutionStrategy;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
+import androidx.core.content.ContextCompat;
+import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ImageAnalysis;
+import androidx.camera.core.ImageProxy;
+import androidx.camera.lifecycle.ProcessCameraProvider;
+
 
 import com.justin.spikeballtracker.R;
 import com.justin.spikeballtracker.tracking.BallCandidate;
+import com.justin.spikeballtracker.video.YuvFrameBuilder;
 import com.justin.spikeballtracker.vision.BlobDetector;
 import com.justin.spikeballtracker.video.BackgroundExporter;
 import com.justin.spikeballtracker.video.FrameExtractor;
 import com.justin.spikeballtracker.vision.ColourDetector;
+import com.justin.spikeballtracker.vision.FramePipeline;
 import com.justin.spikeballtracker.vision.MotionDetector;
 import com.justin.spikeballtracker.vision.NetDetector;
 
@@ -48,12 +64,26 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import com.google.common.util.concurrent.ListenableFuture;
+
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "MainActivity";
     private static final Scalar MARKER_COLOUR = new Scalar(255, 0, 0);
     private FrameExtractor frameExtractor;
     private BackgroundExporter backgroundExporter;
+    // -----
+    private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
+    private ProcessCameraProvider cameraProvider = null;
+    private final AtomicInteger cameraFrameCounter = new AtomicInteger();
+    //----
+    private ImageView frameImageView;
+    //----
+    private final YuvFrameBuilder cameraYuvBuilder = new YuvFrameBuilder();
+    private final Mat cameraRgb = new Mat();
+    private final Mat cameraRotated = new Mat();
+    //---
+    private static final Size PIPELINE_SIZE = new Size(854, 480);
 
     /** Set by the export button, consumed on the processing thread. */
     private final AtomicBoolean backgroundExportRequested = new AtomicBoolean(false);
@@ -94,30 +124,25 @@ public class MainActivity extends AppCompatActivity {
 
     private void displayProcessedVideo(Uri videoUri) {
         stopVideo();
-
-        ImageView frameImageView = findViewById(R.id.frame_image_view);
+        stopCamera();
 
         final AtomicBoolean cancelled = new AtomicBoolean(false);
         activeVideoCancelFlag = cancelled;
 
         activeVideoTask = processingExecutor.submit(() -> {
-            MotionDetector motionDetector = new MotionDetector();
-            ColourDetector colourDetector = new ColourDetector();
-            BlobDetector blobDetector = new BlobDetector();
+            FramePipeline pipeline = new FramePipeline();
 
-            Mat ballMask = new Mat();     // single channel, input to blob detection
             Mat displayMat = new Mat();   // RGB copy of the frame, drawn on
-
-            AtomicInteger frameCounter = new AtomicInteger();
             List<BallCandidate> allCandidates = new ArrayList<>();
+
+            // The provenance block has to run before the first offerFrame, and the
+            // pipeline's own frame index is not available until after process().
+            final AtomicBoolean firstFrame = new AtomicBoolean(true);
 
             // Wall-clock anchor for playback pacing, set on the first frame.
             AtomicLong firstTimestampUs = new AtomicLong(-1);
             AtomicLong playbackStartNs = new AtomicLong(0);
             AtomicLong worstLagMs = new AtomicLong(0);
-
-            cachedNetBox = null;
-            lastNetUpdateUs = -1L;
 
             try {
                 frameExtractor.streamFrames(videoUri, (frame, timestampUs) -> {
@@ -125,11 +150,9 @@ public class MainActivity extends AppCompatActivity {
                         return false;   // stop requested: leave the decode loop
                     }
 
-                    int frameIndex = frameCounter.getAndIncrement();
-
-                    if (frameIndex == 0) {
-                        // readColourInfo has run by now, so the provenance
-                        // recorded is the one actually in force for this clip.
+                    if (firstFrame.getAndSet(false)) {
+                        // readColourInfo has run by now, so the provenance recorded
+                        // is the one actually in force for this clip.
                         FrameExtractor.ColourInfo colour = frameExtractor.colourInfo();
                         BackgroundExporter.Provenance p = new BackgroundExporter.Provenance();
                         p.clipName = videoUri.getLastPathSegment();
@@ -145,37 +168,36 @@ public class MainActivity extends AppCompatActivity {
                         backgroundExporter.beginRun(p);
                     }
 
-                    // Export before anything touches the frame, so what lands on
-                    // disk is byte-identical to what the pipeline consumes.
-                    backgroundExporter.offerFrame(frame, frameIndex, timestampUs);
+                    // 1. detection, overlays, and the periodic net update
+                    boolean manual = backgroundExportRequested.getAndSet(false);
+                    boolean plateWanted =
+                            manual || backgroundExporter.dueForBackground(timestampUs);
 
-                    // 1. feature processing on raw frames
-                    Mat motionMask = motionDetector.processFrame(frame);
-                    Mat colourMask = colourDetector.processFrame(frame);
+                    FramePipeline.Result r =
+                            pipeline.process(frame, timestampUs, displayMat, plateWanted);
 
-                    Core.bitwise_and(colourMask, motionMask, ballMask);
+                    allCandidates.addAll(r.candidates);
 
-                    List<BallCandidate> candidates =
-                            blobDetector.findCandidates(ballMask, frameIndex, timestampUs);
-                    allCandidates.addAll(candidates);
+                    // 2. export. offerFrame no longer writes anything, so it can run
+                    //    after process(); that lets the pipeline own frame numbering.
+                    backgroundExporter.offerFrame(frame, r.frameIndex, timestampUs);
 
-
-                    //2. visual for UI and draw ball candidates
-                    Imgproc.cvtColor(frame, displayMat, Imgproc.COLOR_YUV2RGB);
-                    for (BallCandidate c : candidates) {
-                        Imgproc.circle(displayMat, new Point(c.x, c.y), 12, MARKER_COLOUR, 2);
+                    if (r.backgroundPlate != null) {
+                        backgroundExporter.offerBackground(
+                                r.backgroundPlate, r.frameIndex, timestampUs);
+                        if (manual) {
+                            backgroundExporter.exportPlate(
+                                    r.backgroundPlate, "manual", r.frameIndex, timestampUs);
+                        }
                     }
 
-                    //3. draw the net
-                    updateAndDrawNet(motionDetector, displayMat, timestampUs, frameIndex);
-
-                    //4. render to screen
+                    // 3. render to screen
                     Bitmap bitmap = Bitmap.createBitmap(
                             displayMat.cols(), displayMat.rows(), Bitmap.Config.ARGB_8888);
                     Utils.matToBitmap(displayMat, bitmap);
                     runOnUiThread(() -> frameImageView.setImageBitmap(bitmap));
 
-                    // 5. pace playback against the frame's own presentation
+                    // 4. pace playback against the frame's own presentation
                     //    timestamp, not a fixed per-frame delay. A fixed sleep is
                     //    added on top of however long processing took, so the video
                     //    always ran slower than real time (and ignored its real fps).
@@ -206,10 +228,7 @@ public class MainActivity extends AppCompatActivity {
                 backgroundExporter.endRun();
                 Log.d(TAG, "total candidates: " + allCandidates.size()
                         + ", worst playback lag: " + worstLagMs.get() + "ms");
-                motionDetector.release();
-                colourDetector.release();
-                blobDetector.release();
-                ballMask.release();
+                pipeline.release();
                 displayMat.release();
                 // Clear the interrupt flag so the next task on this single-thread
                 // executor doesn't inherit it.
@@ -221,8 +240,8 @@ public class MainActivity extends AppCompatActivity {
     private static final int BLUR_SIZE = 5;
     private void displayProcessedPhoto(Uri photoUri) {
         stopVideo();
+        stopCamera();
 
-        ImageView frameImageView = findViewById(R.id.frame_image_view);
         NetDetector netDetector = new NetDetector();
 
         processingExecutor.execute(() -> {
@@ -282,67 +301,15 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    private NetDetector netDetector = new NetDetector();
-    private Rect cachedNetBox = null;
-    private long lastNetUpdateUs = -1;
-    private static final long INITIAL_NET_DELAY_US = 10_000_000L;
-    private static final long NET_RECALIBRATION_INTERVAL_US = 5_000_000L;
-    private static final Scalar NET_OVERLAY_COLOUR = new Scalar(0, 255, 255);
-
-    /**
-     * Periodically updates the nets bounding box using the background from MotionDetector
-     *
-     * @param motionDetector motion detector object
-     * @param displayMat
-     * @param timestampUs frames current time stamp.
-     */
-
-    private void updateAndDrawNet(MotionDetector motionDetector, Mat displayMat, long timestampUs, int frameIndex){
-        boolean needsInitialLock = (cachedNetBox == null && timestampUs > INITIAL_NET_DELAY_US);
-        boolean needsRecalibration = (cachedNetBox != null && timestampUs-lastNetUpdateUs >= NET_RECALIBRATION_INTERVAL_US);
-        boolean exportRequested = backgroundExportRequested.getAndSet(false);
-        boolean plateDue = backgroundExporter.dueForBackground(timestampUs);
-
-        //Log.v(TAG, "Needs recalibration: " + needsRecalibration + ". Needs initial lock: " + needsInitialLock);
-
-        if(needsRecalibration || needsInitialLock || exportRequested || plateDue){
-            Mat backgroundMat = new Mat();
-            try{
-                motionDetector.getBackgroundImage(backgroundMat);
-                if(!backgroundMat.empty()){
-                    // Export the plate before detect touches it, so the file is
-                    // exactly the Mat NetDetector is about to be handed. At
-                    // 854x480 its resizeMat is a no-op copy, so this is also
-                    // pixel-for-pixel the image its Canny runs on.
-                    // The exporter owns the ten-second interval; this just offers
-                    // it the plate whenever one has been fetched.
-                    backgroundExporter.offerBackground(backgroundMat, frameIndex, timestampUs);
-
-                    if(exportRequested){
-                        backgroundExporter.exportPlate(
-                                backgroundMat, "manual", frameIndex, timestampUs);
-                    }
-
-                    if(needsRecalibration || needsInitialLock){
-                        NetDetector.NetResult result = netDetector.detect(backgroundMat, NetDetector.ColourSpace.YUV);
-                        if(result != null && result.box != null){
-                            cachedNetBox = result.box;
-                            lastNetUpdateUs = timestampUs;
-                            Log.d(TAG, (needsInitialLock ? "Initial net locked: " : "Net recalibrated: ") + cachedNetBox);
-                        }
-                    }
+    private final ActivityResultLauncher<String> cameraPermissionLauncher =
+            registerForActivityResult(new ActivityResultContracts.RequestPermission(), granted -> {
+                if (granted) {
+                    Log.d(TAG, "camera permission granted");
+                    startCamera();
+                } else {
+                    Log.w(TAG, "camera permission denied");
                 }
-            }catch (Exception e){
-                Log.e(TAG, "Failed to update net from background model", e);
-            }finally {
-                backgroundMat.release();
-            }
-        }
-
-        if(cachedNetBox != null){
-            Imgproc.rectangle(displayMat, cachedNetBox.tl(), cachedNetBox.br(), NET_OVERLAY_COLOUR, 2);
-        }
-    }
+            });
 
     private void stopVideo() {
         AtomicBoolean flag = activeVideoCancelFlag;
@@ -360,21 +327,153 @@ public class MainActivity extends AppCompatActivity {
         activeVideoTask = null;
     }
 
+    private void startCamera() {
+
+
+        ListenableFuture<ProcessCameraProvider> providerFuture =
+                ProcessCameraProvider.getInstance(this);
+
+        providerFuture.addListener(() -> {
+            try {
+                cameraProvider = providerFuture.get();
+
+                ResolutionSelector resolution = new ResolutionSelector.Builder()
+                        .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+                        .setResolutionStrategy(new ResolutionStrategy(
+                                new android.util.Size(1280, 720),
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER))
+                        .build();
+
+                ImageAnalysis analysis = new ImageAnalysis.Builder()
+                        .setResolutionSelector(resolution)
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                        .build();
+
+                analysis.setAnalyzer(cameraExecutor, this::onCameraFrame);
+
+                cameraFrameCounter.set(0);
+                cameraProvider.unbindAll();
+
+                if (cameraPipeline != null) cameraPipeline.release();
+                cameraPipeline = new FramePipeline();
+                cameraFirstTimestampNs = -1L;
+
+                cameraProvider.bindToLifecycle(
+                        this, CameraSelector.DEFAULT_BACK_CAMERA, analysis);
+
+                Log.d(TAG, "camera bound");
+            } catch (Exception e) {
+                Log.e(TAG, "camera bind failed", e);
+            }
+        }, ContextCompat.getMainExecutor(this));
+    }
+
+    private volatile FramePipeline cameraPipeline = null;
+    private long cameraFirstTimestampNs = -1L;
+
+    @OptIn(markerClass = ExperimentalGetImage.class)
+    private void onCameraFrame(ImageProxy proxy) {
+        try {
+            FramePipeline pipeline = cameraPipeline;
+            if (pipeline == null) {
+                return;   // a frame still in flight after stopCamera()
+            }
+
+            Image image = proxy.getImage();
+            if (image == null) {
+                return;   // nothing to convert
+            }
+
+            Mat yuv = cameraYuvBuilder.build(image);
+            Imgproc.resize(yuv, yuv, PIPELINE_SIZE, 0, 0, Imgproc.INTER_AREA);
+
+            // getTimestamp() is nanoseconds from an arbitrary epoch, so rebase it:
+            // INITIAL_NET_DELAY_US only means "ten seconds in" if zero is the start.
+            long tsNs = proxy.getImageInfo().getTimestamp();
+            if (cameraFirstTimestampNs < 0) {
+                cameraFirstTimestampNs = tsNs;
+            }
+            long timestampUs = (tsNs - cameraFirstTimestampNs) / 1_000L;
+
+            long t0 = System.nanoTime();
+            FramePipeline.Result r = pipeline.process(yuv, timestampUs, cameraRgb, false);
+            long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+
+            int i = cameraFrameCounter.getAndIncrement();
+            if (i % 30 == 0) {
+                Log.d(TAG, "frame " + i + " " + elapsedMs + "ms"
+                        + " cands=" + r.candidates.size()
+                        + " net=" + r.netBox);
+            }
+
+            // With the activity locked to landscape this should always be 0 and the
+            // switch should fall straight through. Kept as a guard, not as a feature.
+            Mat display;
+            switch (proxy.getImageInfo().getRotationDegrees()) {
+                case 90:
+                    Core.rotate(cameraRgb, cameraRotated, Core.ROTATE_90_CLOCKWISE);
+                    display = cameraRotated;
+                    break;
+                case 180:
+                    Core.rotate(cameraRgb, cameraRotated, Core.ROTATE_180);
+                    display = cameraRotated;
+                    break;
+                case 270:
+                    Core.rotate(cameraRgb, cameraRotated, Core.ROTATE_90_COUNTERCLOCKWISE);
+                    display = cameraRotated;
+                    break;
+                default:
+                    display = cameraRgb;
+                    break;
+            }
+
+            // Dimensions come from the rotated Mat: 90 and 270 swap them.
+            Bitmap bitmap = Bitmap.createBitmap(
+                    display.cols(), display.rows(), Bitmap.Config.ARGB_8888);
+            Utils.matToBitmap(display, bitmap);
+            runOnUiThread(() -> frameImageView.setImageBitmap(bitmap));
+
+        } catch (Exception e) {
+            Log.e(TAG, "camera frame failed", e);
+        } finally {
+            proxy.close();
+        }
+    }
+
+    private void stopCamera() {
+        if (cameraProvider != null) {
+            runOnUiThread(() -> cameraProvider.unbindAll());
+        }
+        FramePipeline p = cameraPipeline;
+        cameraPipeline = null;
+        if (p != null) {
+            cameraExecutor.execute(p::release);
+        }
+    }
+
     @Override
     protected void onDestroy() {
         super.onDestroy();
         stopVideo();
+        stopCamera();
         processingExecutor.shutdownNow();
         frameExtractor.release();
+        cameraYuvBuilder.release();
+        cameraRgb.release();
+        cameraRotated.release();
+        cameraExecutor.shutdownNow();
     }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        frameExtractor = new FrameExtractor(this);
-        backgroundExporter = new BackgroundExporter(this);
         EdgeToEdge.enable(this);
         setContentView(R.layout.activity_main);
+
+        frameExtractor = new FrameExtractor(this);
+        backgroundExporter = new BackgroundExporter(this);
+        frameImageView = findViewById(R.id.frame_image_view);
 
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main), (v, insets) -> {
             Insets systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
@@ -385,6 +484,7 @@ public class MainActivity extends AppCompatActivity {
         Button selectPhotoButton = findViewById(R.id.select_photo_button);
         selectPhotoButton.setOnClickListener(v -> {
             stopVideo();
+            stopCamera();
             photoPickerLauncher.launch(
                     new PickVisualMediaRequest.Builder()
                             .setMediaType(ActivityResultContracts.PickVisualMedia.ImageOnly.INSTANCE)
@@ -394,11 +494,15 @@ public class MainActivity extends AppCompatActivity {
         Button selectVideoButton = findViewById(R.id.select_video_button);
         selectVideoButton.setOnClickListener(v -> {
             stopVideo();
+            stopCamera();
             videoPickerLauncher.launch(new String[]{"video/*"});
         });
 
         Button stopButton = findViewById(R.id.stop_video_button);
-        stopButton.setOnClickListener(v -> stopVideo());
+        stopButton.setOnClickListener(v ->{
+            stopVideo();
+            stopCamera();
+        });
 
         Button exportButton = findViewById(R.id.export_background_button);
         exportButton.setOnClickListener(v -> {
@@ -409,6 +513,17 @@ public class MainActivity extends AppCompatActivity {
                 Log.d(TAG, "background export requested");
             } else {
                 Log.w(TAG, "no video running, nothing to export");
+            }
+        });
+
+        Button openCameraButton = findViewById(R.id.open_camera_button);
+        openCameraButton.setOnClickListener(v -> {
+            stopVideo();
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                    == PackageManager.PERMISSION_GRANTED) {
+                startCamera();
+            } else {
+                cameraPermissionLauncher.launch(Manifest.permission.CAMERA);
             }
         });
     }

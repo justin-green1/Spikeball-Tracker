@@ -5,21 +5,12 @@ import android.util.Log;
 import org.opencv.core.Core;
 import org.opencv.core.CvType;
 import org.opencv.core.Mat;
-import org.opencv.core.MatOfDouble;
-import org.opencv.core.MatOfFloat;
-import org.opencv.core.MatOfInt;
 import org.opencv.core.MatOfPoint;
-import org.opencv.core.MatOfPoint2f;
-import org.opencv.core.Point;
 import org.opencv.core.Rect;
-import org.opencv.core.RotatedRect;
-import org.opencv.core.Scalar;
 import org.opencv.core.Size;
 import org.opencv.imgproc.Imgproc;
 
-import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
 public class NetDetector {
@@ -31,14 +22,19 @@ public class NetDetector {
     private static final double MIN_Y_FRACTION = 0.63;
     private static final int    MIN_BOX_WIDTH  = 69;
     private static final int    MAX_BOX_WIDTH  = 176;
-    private static final double lowerThreshold = 78.9;
-    private static final double upperThreshold = 98.0;
+    private static final double lowerThreshold = 50.0;
+    private static final double upperThreshold = 100.0;
     private static final double sigmaSpace     = 146.8;
     private static final double sigmaColour    = 184.7;
     private static final int    d              = 7;
     private static final int    MORPH_HEIGHT   = 9;
     private static final int    MORPH_WIDTH    = 19;
     // -----------------------------------------------------------------------
+    // ---- selection constants ----
+    private static final double MAX_CX_OFFSET   = 0.20;   // centre within middle 40%
+    private static final double MIN_CY_FRACTION = 0.50;   // centre below halfway
+    private static final double MIN_DARKNESS    = 0.0;    // net is never brighter than its ground
+    //-----------------------------------------------------------------------
     // scorer parameters
     /** Where the net usually sits, and what shape it is, in a 480p frame. */
     private static final double PRIOR_CX     = 0.50;
@@ -47,7 +43,11 @@ public class NetDetector {
     private static final double SIGMA_CX     = 0.25;
     private static final double SIGMA_CY     = 0.20;
     private static final double SIGMA_ASPECT = 1.0;
-    //
+    //------------------------------------------------------------------------
+    // ---- reusable buffers ----
+    private Mat integral = new Mat();
+    private double[] sum;
+    private int integralWidth;
 
     public static class NetResult{
         public final Rect box;
@@ -142,16 +142,6 @@ public class NetDetector {
         }
     }
 
-    // ---- constants ----
-    private static final double MAX_CX_OFFSET   = 0.20;   // centre within middle 40%
-    private static final double MIN_CY_FRACTION = 0.50;   // centre below halfway
-    private static final double MIN_DARKNESS    = 0.0;    // net is never brighter than its ground
-
-    // ---- reusable buffers, allocated once (not per frame) ----
-    private Mat integral = new Mat();
-    private double[] sum;                                  // (h+1)*(w+1) running sums
-    private int integralWidth;
-
     private List<Rect> findCandidates(Mat edges, Mat grey, int frameWidth, int frameHeight){
         List<Rect> candidates = new ArrayList<>();
         List<MatOfPoint> contours = new ArrayList<>();
@@ -223,7 +213,7 @@ public class NetDetector {
         double bestScore = -1.0;
         for (Rect candidate : candidates) {
             double score = score(candidate, frameWidth, frameHeight);
-            if (score > bestScore) {
+            if (score > bestScore && score > 0.3) {
                 bestScore = score;
                 best = candidate;
             }

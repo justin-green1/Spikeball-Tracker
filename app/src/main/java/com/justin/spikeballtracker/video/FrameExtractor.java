@@ -25,17 +25,12 @@ public class FrameExtractor {
     private final Context context;
     private static final String TAG = "FrameExtractor";
     private static final long BUFFER_TIMEOUT_US = 10_000;
-    private final Mat resizedUMat;
-    private final Mat resizedVMat;
-    private final Mat uPacked = new Mat();
-    private final Mat vPacked = new Mat();
-    private final Mat yuvMat;
-    private int frameIndex = 0;
+    private final YuvFrameBuilder yuvBuilder = new YuvFrameBuilder();
 
-    // What the container claims about colour, read once per stream.
     private volatile String mime = "unknown";
     private volatile String colourRange = "undeclared";
     private volatile String colourStandard = "unknown";
+    private static final Size TARGET_SIZE = new Size(854, 480);
 
     /**
      * True when the decoder's samples are limited range and must be expanded.
@@ -50,9 +45,6 @@ public class FrameExtractor {
 
     public FrameExtractor(Context context) {
         this.context = context.getApplicationContext();
-        this.resizedUMat = new Mat();
-        this.resizedVMat = new Mat();
-        this.yuvMat = new Mat();
     }
 
     /**
@@ -146,7 +138,7 @@ public class FrameExtractor {
             Log.e(TAG, "Could not open video " + videoUri, e);
         } finally {
             release(codec, extractor);
-            releaseScratch();
+            yuvBuilder.release();
         }
     }
 
@@ -269,7 +261,7 @@ public class FrameExtractor {
                 if (bufferInfo.size > 0) {
                     Image image = codec.getOutputImage(outIndex);
                     if (image != null) {
-                        frame = buildYuvMat(image);
+                        frame = buildFrame(image);
                         image.close();
                     }
                 }
@@ -324,99 +316,13 @@ public class FrameExtractor {
         }
     }
 
-    /**
-     * Wraps the luma (Y) plane of a decoded frame as a single-channel Mat.
-     *
-     * <p>No pixel data is copied — the Mat views the codec's output buffer directly,
-     * so it is only valid until the Image is closed. Callers must consume or clone
-     * it before returning.
-     *
-     * @param image decoded frame in YUV_420_888 format
-     * @return grayscale Mat sharing the image's underlying buffer
-     */
-    /**
-     * Builds a 3-channel YUV Mat from a decoded frame.
-     *
-     * <p>Chroma planes may be semi-planar (NV12/NV21, pixel stride 2) or truly
-     * planar (I420, pixel stride 1); both are handled. The U and V planes are
-     * upsampled to full resolution and merged with Y into {@link #yuvMat}.
-     *
-     * <p>The returned Mat is owned by this extractor and is overwritten on the
-     * next call. Callers must not retain it.
-     *
-     * @param image decoded frame in YUV_420_888 format
-     * @return CV_8UC3 Mat with channels in Y, U, V order
-     */
-    private Mat buildYuvMat(Image image) {
-        Image.Plane yPlane = image.getPlanes()[0];
-        Image.Plane uPlane = image.getPlanes()[1];
-        Image.Plane vPlane = image.getPlanes()[2];
-
-        int width = image.getWidth();
-        int height = image.getHeight();
-        int chromaWidth = width / 2;
-        int chromaHeight = height / 2;
-
-        Mat yMat = new Mat(height, width, CvType.CV_8UC1,
-                yPlane.getBuffer(), yPlane.getRowStride());
-
-        Mat uSrc = null;
-        Mat vSrc = null;
-
-        try {
-            if (uPlane.getPixelStride() == 2) {
-                // Semi-planar. Each plane's buffer starts on its own component,
-                // so reading pairs and keeping channel 0 is correct for both
-                // NV12 and NV21 without needing to know which one this is.
-                uSrc = new Mat(chromaHeight, chromaWidth, CvType.CV_8UC2,
-                        uPlane.getBuffer(), uPlane.getRowStride());
-                vSrc = new Mat(chromaHeight, chromaWidth, CvType.CV_8UC2,
-                        vPlane.getBuffer(), vPlane.getRowStride());
-
-                Core.extractChannel(uSrc, uPacked, 0);
-                Core.extractChannel(vSrc, vPacked, 0);
-            } else {
-                // Truly planar (I420) — one byte per sample, no de-interleaving.
-                uSrc = new Mat(chromaHeight, chromaWidth, CvType.CV_8UC1,
-                        uPlane.getBuffer(), uPlane.getRowStride());
-                vSrc = new Mat(chromaHeight, chromaWidth, CvType.CV_8UC1,
-                        vPlane.getBuffer(), vPlane.getRowStride());
-
-                uSrc.copyTo(uPacked);
-                vSrc.copyTo(vPacked);
-            }
-
-            Size fullSize = yMat.size();
-            Imgproc.resize(uPacked, resizedUMat, fullSize, 0, 0, Imgproc.INTER_NEAREST);
-            Imgproc.resize(vPacked, resizedVMat, fullSize, 0, 0, Imgproc.INTER_NEAREST);
-
-            Core.merge(Arrays.asList(yMat, resizedUMat, resizedVMat), yuvMat);
-        } finally {
-            if (uSrc != null) uSrc.release();
-            if (vSrc != null) vSrc.release();
-            yMat.release();
-        }
-
-        Imgproc.resize(yuvMat, yuvMat, new Size(854, 480), 0, 0, Imgproc.INTER_AREA);
-
-        // Put every consumer in the same numeric space as a decoded photo, so a
-        // threshold means the same thing whichever path produced the pixels.
-        // Applied after the resize, on fewer pixels, and before any consumer
-        // sees the frame.
+    private Mat buildFrame(Image image) {
+        Mat yuv = yuvBuilder.build(image);
+        Imgproc.resize(yuv, yuv, TARGET_SIZE, 0, 0, Imgproc.INTER_AREA);
         if (expandToFullRange) {
-            Core.LUT(yuvMat, fullRangeLut, yuvMat);
+            Core.LUT(yuv, fullRangeLut, yuv);
         }
-
-        return yuvMat;
-    }
-
-    /** Frees the per-stream scratch buffers. */
-    private void releaseScratch() {
-        uPacked.release();
-        vPacked.release();
-        resizedUMat.release();
-        resizedVMat.release();
-        yuvMat.release();
+        return yuv;
     }
 
     /**

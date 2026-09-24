@@ -13,7 +13,7 @@ public class MotionDetector {
 
     private static final String TAG = "MotionDetector";
     private final BackgroundSubtractorKNN subtractor;
-    private static final int HISTORY = 8000;
+    private static final int HISTORY = 3600;
     private static final double DIST_2_THRESHOLD = 100;
     private static final boolean DETECT_SHADOWS = true;
     private static final Size BLUR_KERNEL = new Size(9, 9);
