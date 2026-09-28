@@ -37,13 +37,13 @@ public class BlobDetector {
             double x = centroids.get(i, 0)[0];
             double y = centroids.get(i, 1)[0];
 
-            if (area < 15 || area > 400){
+            if (area < 20){
                 continue;
             }
 
 
             bc = new BallCandidate(frameIndex, timestampUs, x, y, area, left, top, width, height);
-            Log.v(TAG, bc.toString());
+            //Log.v(TAG, bc.toString());
             candidates.add(bc);
         }
 

@@ -7,11 +7,13 @@ import android.os.Bundle;
 import android.util.Log;
 import android.widget.Button;
 import android.widget.ImageView;
+import android.widget.Toast;
 
 import androidx.activity.EdgeToEdge;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.PickVisualMediaRequest;
 import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.ContextCompat;
 import androidx.core.graphics.Insets;
@@ -19,6 +21,7 @@ import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
 import com.justin.spikeballtracker.R;
+import com.justin.spikeballtracker.record.ReplayBuffer;
 import com.justin.spikeballtracker.source.CameraSource;
 import com.justin.spikeballtracker.source.PhotoAnalyser;
 import com.justin.spikeballtracker.source.VideoPlayer;
@@ -27,6 +30,8 @@ import org.opencv.android.OpenCVLoader;
 import org.opencv.android.Utils;
 import org.opencv.core.Mat;
 
+import java.util.Locale;
+
 /**
  * Wiring only: three frame sources, one ImageView, and the buttons that switch
  * between them. Anything that touches pixels lives in a source.
@@ -34,6 +39,9 @@ import org.opencv.core.Mat;
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "MainActivity";
+
+    /** The lengths offered by the Save Replay picker. */
+    private static final int[] REPLAY_CHOICES_S = {10, 30, ReplayBuffer.MAX_SAVE_SECONDS};
 
     static {
         if (OpenCVLoader.initLocal()) {
@@ -44,7 +52,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private ImageView frameImageView;
-
     private VideoPlayer videoPlayer;
     private PhotoAnalyser photoAnalyser;
     private CameraSource cameraSource;
@@ -143,6 +150,51 @@ public class MainActivity extends AppCompatActivity {
                 Log.w(TAG, "camera not running, nothing to reset");
             }
         });
+
+        Button saveReplayButton = findViewById(R.id.save_replay_button);
+        saveReplayButton.setOnClickListener(v -> showSaveReplayDialog());
+    }
+
+    /**
+     * Offers 10 / 30 / 60 s. Asking for more than is buffered saves what there
+     * is; the toast reports the real length.
+     */
+    private void showSaveReplayDialog() {
+        double buffered = cameraSource.replaySeconds();
+        if (buffered < 1.0) {
+            toast("Nothing recorded yet. Open the camera first.");
+            return;
+        }
+
+        String[] labels = new String[REPLAY_CHOICES_S.length];
+        for (int i = 0; i < labels.length; i++) {
+            labels[i] = "Last " + REPLAY_CHOICES_S[i] + " s";
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle(String.format(Locale.US, "Save replay (%.0f s buffered)", buffered))
+                .setItems(labels, (dialog, which) ->
+                        cameraSource.saveReplay(REPLAY_CHOICES_S[which],
+                                new ReplayBuffer.SaveCallback() {
+                                    @Override
+                                    public void onSaved(String displayName, double seconds) {
+                                        toast(String.format(Locale.US,
+                                                "Saved %.1f s to Movies/SpikeballTracker/%s",
+                                                seconds, displayName));
+                                    }
+
+                                    @Override
+                                    public void onFailed(String reason) {
+                                        toast("Replay save failed: " + reason);
+                                    }
+                                }))
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    /** Safe from any thread; the save callbacks arrive on the save thread. */
+    private void toast(String message) {
+        runOnUiThread(() -> Toast.makeText(this, message, Toast.LENGTH_LONG).show());
     }
 
     /**

@@ -4,6 +4,7 @@ import android.content.Context;
 import android.net.Uri;
 import android.util.Log;
 
+import com.justin.spikeballtracker.record.DetectionLog;
 import com.justin.spikeballtracker.tracking.BallCandidate;
 import com.justin.spikeballtracker.video.BackgroundExporter;
 import com.justin.spikeballtracker.video.FrameExtractor;
@@ -18,17 +19,22 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Plays a recorded clip through the pipeline at its true frame rate.
  *
  * <p>Owns the extractor and the background exporter, because it is the only
  * path that produces exportable plates.
+ *
+ * <p>Every clip also writes a {@link DetectionLog}, the per-frame ball
+ * candidates and net box, into the same run folder as its plates.
  */
 public final class VideoPlayer {
 
     private static final String TAG = "VideoPlayer";
 
+    private final Context appContext;
     private final FrameExtractor frameExtractor;
     private final BackgroundExporter backgroundExporter;
 
@@ -42,6 +48,7 @@ public final class VideoPlayer {
     private volatile AtomicBoolean activeCancelFlag = null;
 
     public VideoPlayer(Context context) {
+        this.appContext = context.getApplicationContext();
         this.frameExtractor = new FrameExtractor(context);
         this.backgroundExporter = new BackgroundExporter(context);
     }
@@ -58,6 +65,8 @@ public final class VideoPlayer {
             PlaybackClock clock = new PlaybackClock();
             List<BallCandidate> allCandidates = new ArrayList<>();
             final AtomicBoolean firstFrame = new AtomicBoolean(true);
+            // Set on the first frame, once the export run (and so the folder) exists.
+            final AtomicReference<DetectionLog> log = new AtomicReference<>(null);
 
             try {
                 frameExtractor.streamFrames(videoUri, (frame, timestampUs) -> {
@@ -67,6 +76,7 @@ public final class VideoPlayer {
 
                     if (firstFrame.getAndSet(false)) {
                         beginExportRun(videoUri, frame);
+                        log.set(newDetectionLog(videoUri, frame));
                     }
 
                     boolean manual = exportRequested.getAndSet(false);
@@ -76,6 +86,10 @@ public final class VideoPlayer {
                     FramePipeline.Result r =
                             pipeline.process(frame, timestampUs, displayMat, plateWanted);
                     allCandidates.addAll(r.candidates);
+
+                    // For video the pipeline's timestamp is the PTS itself.
+                    log.get().write(r.frameIndex, timestampUs, timestampUs,
+                            r.candidates, r.netBox);
 
                     // offerFrame no longer writes anything, so it can run after
                     // process(); that lets the pipeline own frame numbering.
@@ -93,6 +107,10 @@ public final class VideoPlayer {
                     return clock.waitFor(timestampUs);
                 });
             } finally {
+                DetectionLog l = log.get();
+                if (l != null) {
+                    l.close();
+                }
                 backgroundExporter.endRun();
                 Log.d(TAG, "total candidates: " + allCandidates.size()
                         + ", worst playback lag: " + clock.worstLagMs() + "ms");
@@ -152,6 +170,24 @@ public final class VideoPlayer {
         p.knnDetectShadows = MotionDetector.detectShadows();
         p.knnPreBlurKernel = MotionDetector.preBlurKernel();
         backgroundExporter.beginRun(p);
+    }
+
+    /** Called after beginExportRun, so it can share the run's folder. */
+    private DetectionLog newDetectionLog(Uri videoUri, Mat firstFrame) {
+        FrameExtractor.ColourInfo colour = frameExtractor.colourInfo();
+        DetectionLog.Meta m = new DetectionLog.Meta();
+        m.source = "video";
+        m.clipName = videoUri.getLastPathSegment();
+        m.frameWidth = firstFrame.cols();
+        m.frameHeight = firstFrame.rows();
+        m.colourRange = colour.range;
+        m.colourStandard = colour.standard;
+        m.expandToFullRange = colour.expandToFullRange;
+        m.knnHistory = MotionDetector.history();
+        m.knnDist2Threshold = MotionDetector.dist2Threshold();
+        m.knnDetectShadows = MotionDetector.detectShadows();
+        m.knnPreBlurKernel = MotionDetector.preBlurKernel();
+        return new DetectionLog(appContext, backgroundExporter.runId(), m);
     }
 
     /**

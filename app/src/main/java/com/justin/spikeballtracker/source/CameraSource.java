@@ -9,6 +9,7 @@ import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ExperimentalGetImage;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
+import androidx.camera.core.Preview;
 import androidx.camera.core.resolutionselector.AspectRatioStrategy;
 import androidx.camera.core.resolutionselector.ResolutionSelector;
 import androidx.camera.core.resolutionselector.ResolutionStrategy;
@@ -17,6 +18,7 @@ import androidx.core.content.ContextCompat;
 import androidx.lifecycle.LifecycleOwner;
 
 import com.google.common.util.concurrent.ListenableFuture;
+import com.justin.spikeballtracker.record.ReplayBuffer;
 import com.justin.spikeballtracker.video.FrameExtractor;
 import com.justin.spikeballtracker.video.YuvFrameBuilder;
 import com.justin.spikeballtracker.vision.FramePipeline;
@@ -29,6 +31,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import com.justin.spikeballtracker.record.DetectionLog;
+import com.justin.spikeballtracker.vision.MotionDetector;
 
 /**
  * Live camera frames, converted into the pipeline's working format and run
@@ -41,6 +45,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>The analysis buffer is always landscape regardless of how the phone is
  * held, and the detectors' geometry priors assume the world is upright in that
  * buffer — which is only true with the activity locked to landscape.
+ *
+ * <p>A second use case, {@link Preview}, runs alongside the analysis stream and
+ * feeds {@link ReplayBuffer}'s encoder, which holds the last minute of 720p
+ * footage for {@link #saveReplay}. The two streams are independent: a slow
+ * pipeline drops analysis frames but never recorded ones.
  */
 public final class CameraSource {
 
@@ -50,8 +59,13 @@ public final class CameraSource {
     private static final android.util.Size ANALYSIS_TARGET =
             new android.util.Size(1280, 720);
 
+    /** What the replay recording asks for. */
+    private static final android.util.Size RECORD_TARGET =
+            new android.util.Size(1280, 720);
+
     private final Context appContext;
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
+    private final ReplayBuffer replayBuffer;
 
     private final YuvFrameBuilder yuvBuilder = new YuvFrameBuilder();
     private final Mat rgb = new Mat();
@@ -59,16 +73,38 @@ public final class CameraSource {
     private final AtomicInteger frameCounter = new AtomicInteger();
 
     private ProcessCameraProvider cameraProvider = null;
-    private volatile FramePipeline pipeline = null;
+    /**
+     * One camera session's pipeline and its detection log. Swapped as a unit
+     * through a single volatile field, so a frame can never be processed by one
+     * session's pipeline and logged into another session's file.
+     */
+    private static final class Run {
+        final FramePipeline pipeline;
+        final DetectionLog log;
+
+        Run(FramePipeline pipeline, DetectionLog log) {
+            this.pipeline = pipeline;
+            this.log = log;
+        }
+
+        /** Analyser thread only: both hold state that thread was using. */
+        void release() {
+            pipeline.release();
+            log.close();
+        }
+    }
+
+    private volatile Run run = null;
     private volatile FrameSink sink = null;
     private long firstTimestampNs = 0L;   // analyser thread only
 
     public CameraSource(Context context) {
         this.appContext = context.getApplicationContext();
+        this.replayBuffer = new ReplayBuffer(appContext);
     }
 
     public boolean isRunning() {
-        return pipeline != null;
+        return run != null;
     }
 
     /** Caller must already hold CAMERA permission. */
@@ -98,14 +134,34 @@ public final class CameraSource {
 
                 analysis.setAnalyzer(cameraExecutor, this::onFrame);
 
+                Preview recording = new Preview.Builder()
+                        .setResolutionSelector(new ResolutionSelector.Builder()
+                                .setAspectRatioStrategy(
+                                        AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+                                .setResolutionStrategy(new ResolutionStrategy(
+                                        RECORD_TARGET,
+                                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER))
+                                .build())
+                        .build();
+                replayBuffer.attachTo(recording);
+
                 cameraProvider.unbindAll();
                 frameCounter.set(0);
-                replacePipeline(new FramePipeline());
+                replaceRun(newRun());
 
-                cameraProvider.bindToLifecycle(
-                        owner, CameraSelector.DEFAULT_BACK_CAMERA, analysis);
-
-                Log.d(TAG, "camera bound");
+                try {
+                    cameraProvider.bindToLifecycle(
+                            owner, CameraSelector.DEFAULT_BACK_CAMERA, analysis, recording);
+                    Log.d(TAG, "camera bound (analysis + replay recording)");
+                } catch (IllegalArgumentException e) {
+                    // The device cannot run both streams at these sizes. Detection
+                    // matters more than the replay, so keep analysis alone.
+                    Log.w(TAG, "analysis + recording not supported; binding analysis only", e);
+                    cameraProvider.unbindAll();
+                    cameraProvider.bindToLifecycle(
+                            owner, CameraSelector.DEFAULT_BACK_CAMERA, analysis);
+                    Log.d(TAG, "camera bound (analysis only, no replay)");
+                }
             } catch (Exception e) {
                 Log.e(TAG, "camera bind failed", e);
             }
@@ -117,7 +173,7 @@ public final class CameraSource {
             ContextCompat.getMainExecutor(appContext)
                     .execute(() -> cameraProvider.unbindAll());
         }
-        replacePipeline(null);
+        replaceRun(null);
         sink = null;
     }
 
@@ -142,21 +198,46 @@ public final class CameraSource {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+        replayBuffer.release();
     }
 
-    /** Swaps the pipeline, releasing the old one on the thread that used it. */
-    private void replacePipeline(FramePipeline next) {
-        FramePipeline previous = pipeline;
-        pipeline = next;
+    /**
+     * Swaps the session, releasing the old pipeline and closing the old log on
+     * the thread that used them. The close is queued behind any frame still in
+     * flight, so that frame's row is written before the file is published.
+     */
+    private void replaceRun(Run next) {
+        Run previous = run;
+        run = next;
         if (previous != null) {
             cameraExecutor.execute(previous::release);
         }
     }
 
+    /** Cheap: the log opens its file on the first frame, on the analyser thread. */
+    private Run newRun() {
+        DetectionLog.Meta m = new DetectionLog.Meta();
+        m.source = "camera";
+        m.clipName = "camera";
+        m.frameWidth = (int) FrameExtractor.TARGET_SIZE.width;
+        m.frameHeight = (int) FrameExtractor.TARGET_SIZE.height;
+        m.colourRange = "camera (assumed full)";
+        m.colourStandard = "camera";
+        m.expandToFullRange = false;   // the camera path applies no LUT
+        m.knnHistory = MotionDetector.history();
+        m.knnDist2Threshold = MotionDetector.dist2Threshold();
+        m.knnDetectShadows = MotionDetector.detectShadows();
+        m.knnPreBlurKernel = MotionDetector.preBlurKernel();
+        m.note = "analysis frames are resized to the working frame regardless of the "
+                + "camera's aspect ratio; frames dropped by KEEP_ONLY_LATEST have no row";
+        return new Run(new FramePipeline(),
+                new DetectionLog(appContext, DetectionLog.newRunId("camera"), m));
+    }
+
     @OptIn(markerClass = ExperimentalGetImage.class)
     private void onFrame(ImageProxy proxy) {
         try {
-            FramePipeline current = pipeline;
+            Run current = run;
             FrameSink target = sink;
             if (current == null || target == null) {
                 return;   // a frame still in flight after stop()
@@ -181,8 +262,13 @@ public final class CameraSource {
             long timestampUs = (tsNs - firstTimestampNs) / 1_000L;
 
             long t0 = System.nanoTime();
-            FramePipeline.Result r = current.process(yuv, timestampUs, rgb, false);
+            FramePipeline.Result r = current.pipeline.process(yuv, timestampUs, rgb, false);
             long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+
+            // Sensor time is the clock the replay encoder also stamps its frames
+            // with, so it is what lines these rows up with a saved replay later.
+            current.log.write(r.frameIndex, timestampUs, tsNs / 1_000L,
+                    r.candidates, r.netBox);
 
             if (index % 30 == 0) {
                 Log.d(TAG, "frame " + index + " " + elapsedMs + "ms"
@@ -221,11 +307,24 @@ public final class CameraSource {
 
     /** @return false when the camera is not running, so there is nothing to reset. */
     public boolean requestBackgroundReset() {
-        FramePipeline current = pipeline;
+        Run current = run;
         if (current == null) {
             return false;
         }
-        current.requestReset();
+        current.pipeline.requestReset();
         return true;
+    }
+
+    /**
+     * Seconds of footage available to {@link #saveReplay}. Still valid after
+     * {@link #stop()}; the buffer is only cleared when the camera next starts.
+     */
+    public double replaySeconds() {
+        return replayBuffer.bufferedSeconds();
+    }
+
+    /** Saves the last {@code seconds} of camera footage as an MP4. Returns at once. */
+    public void saveReplay(int seconds, ReplayBuffer.SaveCallback callback) {
+        replayBuffer.save(seconds, callback);
     }
 }
