@@ -11,7 +11,6 @@ import android.widget.Toast;
 
 import androidx.activity.EdgeToEdge;
 import androidx.activity.result.ActivityResultLauncher;
-import androidx.activity.result.PickVisualMediaRequest;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
@@ -23,7 +22,6 @@ import androidx.core.view.WindowInsetsCompat;
 import com.justin.spikeballtracker.R;
 import com.justin.spikeballtracker.record.ReplayBuffer;
 import com.justin.spikeballtracker.source.CameraSource;
-import com.justin.spikeballtracker.source.PhotoAnalyser;
 import com.justin.spikeballtracker.source.VideoPlayer;
 
 import org.opencv.android.OpenCVLoader;
@@ -33,7 +31,7 @@ import org.opencv.core.Mat;
 import java.util.Locale;
 
 /**
- * Wiring only: three frame sources, one ImageView, and the buttons that switch
+ * Wiring only: two frame sources, one ImageView, and the buttons that switch
  * between them. Anything that touches pixels lives in a source.
  */
 public class MainActivity extends AppCompatActivity {
@@ -53,7 +51,6 @@ public class MainActivity extends AppCompatActivity {
 
     private ImageView frameImageView;
     private VideoPlayer videoPlayer;
-    private PhotoAnalyser photoAnalyser;
     private CameraSource cameraSource;
 
     // Activity result contracts must be registered as field initialisers;
@@ -66,15 +63,6 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
                 videoPlayer.play(uri, this::showFrame);
-            });
-
-    private final ActivityResultLauncher<PickVisualMediaRequest> photoPickerLauncher =
-            registerForActivityResult(new ActivityResultContracts.PickVisualMedia(), uri -> {
-                if (uri == null) {
-                    Log.w(TAG, "no photo selected");
-                    return;
-                }
-                photoAnalyser.analyse(uri, this::showFrame);
             });
 
     private final ActivityResultLauncher<String> cameraPermissionLauncher =
@@ -95,7 +83,6 @@ public class MainActivity extends AppCompatActivity {
         frameImageView = findViewById(R.id.frame_image_view);
 
         videoPlayer = new VideoPlayer(this);
-        photoAnalyser = new PhotoAnalyser(this);
         cameraSource = new CameraSource(this);
 
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main), (v, insets) -> {
@@ -108,15 +95,6 @@ public class MainActivity extends AppCompatActivity {
         selectVideoButton.setOnClickListener(v -> {
             stopAllSources();
             videoPickerLauncher.launch(new String[]{"video/*"});
-        });
-
-        Button selectPhotoButton = findViewById(R.id.select_photo_button);
-        selectPhotoButton.setOnClickListener(v -> {
-            stopAllSources();
-            photoPickerLauncher.launch(
-                    new PickVisualMediaRequest.Builder()
-                            .setMediaType(ActivityResultContracts.PickVisualMedia.ImageOnly.INSTANCE)
-                            .build());
         });
 
         Button openCameraButton = findViewById(R.id.open_camera_button);
@@ -214,14 +192,12 @@ public class MainActivity extends AppCompatActivity {
     private void stopAllSources() {
         videoPlayer.stop();
         cameraSource.stop();
-        // PhotoAnalyser is one-shot; there is nothing to interrupt.
     }
 
     @Override
     protected void onDestroy() {
         stopAllSources();
         videoPlayer.release();
-        photoAnalyser.release();
         cameraSource.release();
         super.onDestroy();
     }

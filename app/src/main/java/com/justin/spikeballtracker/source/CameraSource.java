@@ -230,7 +230,7 @@ public final class CameraSource {
         m.knnPreBlurKernel = MotionDetector.preBlurKernel();
         m.note = "analysis frames are resized to the working frame regardless of the "
                 + "camera's aspect ratio; frames dropped by KEEP_ONLY_LATEST have no row";
-        return new Run(new FramePipeline(),
+        return new Run(new FramePipeline(true),
                 new DetectionLog(appContext, DetectionLog.newRunId("camera"), m));
     }
 

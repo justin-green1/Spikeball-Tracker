@@ -29,10 +29,12 @@ public class ColourDetector {
      */
     public ColourDetector(){
         this.colourMask = new Mat();
-        this.lowerBound = new Scalar(64, 43, 143) ;
-        this.upperBound = new Scalar(224, 87, 167);
+        this.lowerBound = new Scalar(64, 43, 130) ;
+        this.upperBound = new Scalar(224, 120, 167);
 
+        //U 43–120, V 130–167 super wide
         //U 43–87, V 143–167 tighter
+
         //U 43–101, V 143–167 looser
     }
 

@@ -37,7 +37,7 @@ public class BlobDetector {
             double x = centroids.get(i, 0)[0];
             double y = centroids.get(i, 1)[0];
 
-            if (area < 20){
+            if (area < 40){
                 continue;
             }
 

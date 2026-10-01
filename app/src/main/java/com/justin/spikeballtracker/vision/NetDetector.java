@@ -13,27 +13,37 @@ import org.opencv.imgproc.Imgproc;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Finds the net in a KNN background plate.
+ *
+ * <p>The only caller is {@link FramePipeline}, and both of its sources resize
+ * every frame to 854x480 before the pipeline sees it, so the plate always
+ * arrives at the working resolution. Nothing here resizes or maps coordinates
+ * back: every pixel constant below is in 480p units, and the returned box is
+ * already in plate (and so display) coordinates.
+ */
 public class NetDetector {
     private static final String TAG = "NetDetector";
-    private static final double WORK_HEIGHT = 480.0;    // Image pixel height
+    /** The only plate height {@link #detect} accepts; the pixel constants below assume it. */
+    private static final int WORK_HEIGHT = 480;
 
     // ---------------------------------------------------------------------
     // candidate parameters.
-    private static final double MIN_Y_FRACTION = 0.63;
-    private static final int    MIN_BOX_WIDTH  = 69;
-    private static final int    MAX_BOX_WIDTH  = 176;
-    private static final double lowerThreshold = 50.0;
-    private static final double upperThreshold = 100.0;
-    private static final double sigmaSpace     = 146.8;
-    private static final double sigmaColour    = 184.7;
-    private static final int    d              = 7;
-    private static final int    MORPH_HEIGHT   = 9;
-    private static final int    MORPH_WIDTH    = 19;
-    // -----------------------------------------------------------------------
-    // ---- selection constants ----
-    private static final double MAX_CX_OFFSET   = 0.20;   // centre within middle 40%
-    private static final double MIN_CY_FRACTION = 0.50;   // centre below halfway
-    private static final double MIN_DARKNESS    = 0.0;    // net is never brighter than its ground
+
+    private static final double MIN_Y_FRACTION  = 0.69;     // was 0.67
+    private static final int    MIN_BOX_WIDTH   = 75;
+    private static final int    MAX_BOX_WIDTH   = 220;
+    private static final double lowerThreshold  = 57.1;     // = upper / 2.09
+    private static final double upperThreshold  = 119.25;
+    private static final double sigmaSpace      = 152.8;    // has no effect at d = 5
+    private static final double sigmaColour     = 146.6;
+    private static final int    d               = 5;
+    private static final int    MORPH_HEIGHT    = 9;
+    private static final int    MORPH_WIDTH     = 25;       // was 21
+    private static final double MAX_CX_OFFSET   = 0.14;
+    private static final double MIN_CY_FRACTION = 0.50;
+    private static final double MIN_DARKNESS    = -9.0;
+    private static final double MIN_SCORE       = 0.38;
     //-----------------------------------------------------------------------
     // scorer parameters
     /** Where the net usually sits, and what shape it is, in a 480p frame. */
@@ -57,76 +67,48 @@ public class NetDetector {
         }
     }
 
-    public enum ColourSpace {
-        /** 3-channel YUV; channel 0 is luma. Decoder output. */
-        YUV,
-        /** 4-channel RGBA, as produced by Utils.bitmapToMat. */
-        RGBA,
-        /** Already single-channel luma. */
-        GRAY
-    }
+    /**
+     * @param plate CV_8UC3 Y,U,V background plate from the KNN model, at the
+     *              working resolution (854x480)
+     * @return the net box in plate coordinates, or null if no candidate scores
+     *         high enough or the plate is not {@value #WORK_HEIGHT} rows high
+     */
+    public NetResult detect(Mat plate) {
+        if (plate == null || plate.empty()) return null;
 
-    public NetResult detect(Mat background, ColourSpace space) {
-        if (background == null || background.empty()) return null;
+        // Guards the "already at working resolution" contract. A source that
+        // skipped its resize would otherwise get boxes judged against 480p
+        // constants at the wrong scale, silently.
+        if (plate.rows() != WORK_HEIGHT) {
+            Log.w(TAG, "plate is " + plate.cols() + "x" + plate.rows()
+                    + ", expected " + WORK_HEIGHT + " rows; skipping detect");
+            return null;
+        }
 
-        Mat work = new Mat();
         Mat grey = new Mat();
         Mat edges = new Mat();
 
         try {
-            double scale = WORK_HEIGHT / (double) background.rows();
-            resizeMat(background, work);
-            toGrey(work, grey, space);
+            // Canny needs one channel, and in YUV that is simply the Y (luma) plane.
+            Core.extractChannel(plate, grey, 0);
             extractEdges(grey, edges);
 
-            List<Rect> candidates = findCandidates(edges, grey, work.cols(), work.rows());
-            Rect bestAt480p = pickBest(candidates, work.cols(), work.rows());
+            List<Rect> candidates = findCandidates(edges, grey, grey.cols(), grey.rows());
+            Rect best = pickBest(candidates, grey.cols(), grey.rows());
 
-            if (bestAt480p == null) {
-                return null;
-            }
-
-            // Map back to original image coordinate space
-            Rect originalBox = scaleToOriginal(bestAt480p, scale);
-            return new NetResult(originalBox);
+            return best == null ? null : new NetResult(best);
 
         } finally {
-            work.release();
             grey.release();
             edges.release();
         }
     }
 
-    //resize img to standard definition.
-    private void resizeMat(Mat src, Mat dst){
-        double scale = WORK_HEIGHT/src.rows();
-        if (Math.abs(scale - 1.0) < 0.01){
-            //image is already in the correct resolution
-            src.copyTo(dst);
-        }else{
-            //resize img to working resolution = 480p
-            Imgproc.resize(src, dst, new Size(), scale, scale, Imgproc.INTER_AREA);
-        }
-    }
-
-    //convert image to greyscale by taking luma plane from YUV because CANNY algorithm expects a greyscale image.
-    private void toGrey(Mat src, Mat dst, ColourSpace space) {
-        switch (space) {
-            case GRAY:
-                src.copyTo(dst);
-                break;
-            case YUV:
-                Core.extractChannel(src, dst, 0);          // Y == luma
-                break;
-            case RGBA:
-                Imgproc.cvtColor(src, dst, Imgproc.COLOR_RGBA2GRAY);
-                break;
-            default:
-                throw new IllegalArgumentException("Unhandled colour space: " + space);
-        }
-    }
-
-    //uses bilateral filter and gaussian blurring openCV algorithms to find the edges in the image.
+    /**
+     * Edge map for the candidate search: a bilateral filter flattens texture
+     * while keeping strong edges, Canny finds them, and a wide, short
+     * elliptical close joins the net rim's broken edge runs into one contour.
+     */
     private void extractEdges(Mat src, Mat dst){
         Mat filtered = new Mat();
         Mat kernel = null;
@@ -192,6 +174,7 @@ public class NetDetector {
                 candidates.add(box);
             }
 
+            //candidates = suppressContained(candidates);
             Log.d(TAG, "Raw contours: " + contours.size() + "| Candidates Retained: " + candidates.size());
             return candidates;
         }
@@ -213,7 +196,7 @@ public class NetDetector {
         double bestScore = -1.0;
         for (Rect candidate : candidates) {
             double score = score(candidate, frameWidth, frameHeight);
-            if (score > bestScore && score > 0.3) {
+            if (score > bestScore && score > MIN_SCORE) {
                 bestScore = score;
                 best = candidate;
             }
@@ -243,16 +226,5 @@ public class NetDetector {
     private static double gaussian(double value, double mean, double sigma) {
         double z = (value - mean) / sigma;
         return Math.exp(-z * z);
-    }
-
-    private Rect scaleToOriginal(Rect r, double scale) {
-        if (r == null) return null;
-        double inv = 1.0 / scale;
-        return new Rect(
-                (int) Math.round(r.x * inv),
-                (int) Math.round(r.y * inv),
-                (int) Math.round(r.width * inv),
-                (int) Math.round(r.height * inv)
-        );
     }
 }

@@ -6,7 +6,6 @@ import org.opencv.core.Mat;
 import org.opencv.core.Size;
 import org.opencv.imgproc.Imgproc;
 import org.opencv.video.BackgroundSubtractorKNN;
-import org.opencv.video.BackgroundSubtractorMOG2;
 import org.opencv.video.Video;
 
 public class MotionDetector {
@@ -39,14 +38,19 @@ public class MotionDetector {
     }
 
     /**
-     * Applies MOG2 background subtraction to the frame
+     * Blurs the frame with the 9x9 pre-blur, then feeds it to the KNN
+     * background subtractor, updating the model.
      *
-     * @param frame video frame which background subtraction is applied to
-     * @return output Mat frame which has had background subtraction performed on it as Bitmap.
+     * @param frame CV_8UC3 Y,U,V frame at the working resolution
+     * @return binary foreground mask (0 or 255), owned by this detector and
+     *         overwritten on the next call
      */
     public Mat processFrame(Mat frame) {
         Imgproc.GaussianBlur(frame, blurredFrame, BLUR_KERNEL, 0);
         subtractor.apply(blurredFrame, foregroundMask);
+
+        // Maps <= 127 to 0, and > 127 (i.e., 255) to 255
+        Imgproc.threshold(foregroundMask, foregroundMask, 127, 255, Imgproc.THRESH_BINARY);
         return foregroundMask;
     }
 

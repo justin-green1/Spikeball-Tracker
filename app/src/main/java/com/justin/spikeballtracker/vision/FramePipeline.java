@@ -65,6 +65,20 @@ public final class FramePipeline {
     private final Mat ballMask   = new Mat();
     private final Mat background = new Mat();
 
+    private final Mat greyY   = new Mat();
+    private final Mat greyRgb = new Mat();
+
+    /** Camera view: greyscale everywhere except pixels that pass motion AND colour. */
+    private final boolean highlightDetections;
+
+    public FramePipeline() {
+        this(false);   // the video path keeps its full-colour display
+    }
+
+    public FramePipeline(boolean highlightDetections) {
+        this.highlightDetections = highlightDetections;
+    }
+
     private int  frameIndex      = 0;
 
     /**
@@ -92,6 +106,13 @@ public final class FramePipeline {
                 blobDetector.findCandidates(ballMask, index, timestampUs);
 
         Imgproc.cvtColor(yuv, displayOut, Imgproc.COLOR_YUV2RGB);
+        if (highlightDetections) {
+            Core.extractChannel(yuv, greyY, 0);                     // Y is already the greyscale image
+            Imgproc.cvtColor(greyY, greyRgb, Imgproc.COLOR_GRAY2RGB);   // 3 channels, so it can hold colour
+            displayOut.copyTo(greyRgb, ballMask);                       // colour back in where the mask is on
+            greyRgb.copyTo(displayOut);
+        }
+
         for (BallCandidate c : candidates) {
             Imgproc.circle(displayOut, new Point(c.x, c.y), 12, MARKER_COLOUR, 2);
         }
@@ -141,7 +162,7 @@ public final class FramePipeline {
                 lastNetAttemptUs = timestampUs;
 
                 NetDetector.NetResult result =
-                        netDetector.detect(background, NetDetector.ColourSpace.YUV);
+                        netDetector.detect(background);
 
                 if (result != null && result.box != null) {
                     cachedNetBox = result.box;
@@ -176,5 +197,7 @@ public final class FramePipeline {
         blobDetector.release();
         ballMask.release();
         background.release();
+        greyY.release();
+        greyRgb.release();
     }
 }
