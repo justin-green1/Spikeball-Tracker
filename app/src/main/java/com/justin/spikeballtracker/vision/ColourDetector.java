@@ -18,6 +18,15 @@ public class ColourDetector {
     private static final Scalar WIDE_LO = new Scalar(0, 43, 130);
     private static final Scalar WIDE_HI = new Scalar(255, 120, 167);
 
+    /**
+     * The wide box widened by 10 % of its span on each side, rounded outward:
+     * the box the blob SVM's training crops were cut with
+     * (studies/classifier/extract_blob_candidates.py). The SVM decides what is
+     * a ball inside it, so it is deliberately loose.
+     */
+    public static final Scalar SVM_LO = new Scalar(0, 35, 126);
+    public static final Scalar SVM_HI = new Scalar(255, 128, 171);
+
 
      /**
      * Matches the ball on chroma alone; the luma bounds stay wide open so
@@ -50,6 +59,11 @@ public class ColourDetector {
 
     public static ColourDetector wide(){
         return new ColourDetector(WIDE_LO, WIDE_HI);
+    }
+
+    /** The widened box the blob SVM was trained behind; see {@link #SVM_LO}. */
+    public static ColourDetector svmBox(){
+        return new ColourDetector(SVM_LO, SVM_HI);
     }
 
     public Mat processFrame(Mat Frame) {

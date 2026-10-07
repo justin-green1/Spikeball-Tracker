@@ -19,6 +19,9 @@ public class MotionDetector {
     private final Mat blurredFrame;
     private final Mat foregroundMask;
 
+    /** This frame's mask before thresholding: 255 motion, 127 shadow, 0 still. */
+    private final Mat maskWithShadows;
+
     /**
      * Performs KNN background subtraction on a sequence of video frames.
      *
@@ -30,6 +33,7 @@ public class MotionDetector {
     public MotionDetector(){
         this.subtractor = newSubtractor();
         this.foregroundMask = new Mat();
+        this.maskWithShadows = new Mat();
         this.blurredFrame = new Mat();
     }
 
@@ -48,10 +52,24 @@ public class MotionDetector {
     public Mat processFrame(Mat frame) {
         Imgproc.GaussianBlur(frame, blurredFrame, BLUR_KERNEL, 0);
         subtractor.apply(blurredFrame, foregroundMask);
+        foregroundMask.copyTo(maskWithShadows);
 
         // Maps <= 127 to 0, and > 127 (i.e., 255) to 255
         Imgproc.threshold(foregroundMask, foregroundMask, 127, 255, Imgproc.THRESH_BINARY);
         return foregroundMask;
+    }
+
+    /**
+     * The last frame's mask with shadow pixels kept (127), as
+     * {@link #processFrame} computed it before thresholding.
+     *
+     * <p>The blob SVM's training blobs were cut from this unthresholded mask
+     * (the offline replica ANDs it with the colour box as-is, so shadow pixels
+     * count as foreground), so the SVM path uses it to see blobs the same way.
+     * Owned by this detector and overwritten on the next call.
+     */
+    public Mat maskWithShadows() {
+        return maskWithShadows;
     }
 
     /**
@@ -99,6 +117,7 @@ public class MotionDetector {
      */
     public void release() {
         this.foregroundMask.release();
+        this.maskWithShadows.release();
         this.subtractor.clear();
         this.blurredFrame.release();
     }

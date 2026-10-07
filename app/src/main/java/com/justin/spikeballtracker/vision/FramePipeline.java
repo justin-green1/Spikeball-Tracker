@@ -39,6 +39,18 @@ public final class FramePipeline {
 
     private static final String TAG = "FramePipeline";
 
+    /**
+     * Which detector feeds the tracker.
+     *
+     * <p>true: one widened colour box ANDed with the motion mask (shadows kept),
+     * every 15-400 px blob scored by {@link BlobSvm}; narrow candidates are those
+     * with P(ball) >= {@link BlobSvm#NARROW_THRESHOLD}, wide those with
+     * P(ball) >= {@link BlobSvm#WIDE_THRESHOLD}, so narrow is a subset of wide.
+     *
+     * <p>false: the narrow and wide colour boxes, as before.
+     */
+    public static final boolean USE_BLOB_SVM = true;
+
     /** The display Mat is RGB, so this is (R, G, B). */
     private static final Scalar NET_COLOUR = new Scalar(0, 255, 255);
 
@@ -54,10 +66,18 @@ public final class FramePipeline {
         /** 0-based index of the frame this result describes. */
         public final int frameIndex;
 
-        /** Blobs that passed the narrow colour box and the motion mask. */
+        /**
+         * Blobs that passed the narrow colour box and the motion mask, or with
+         * {@link #USE_BLOB_SVM}, moving blobs the SVM scored at or above its
+         * narrow threshold.
+         */
         public final List<BallCandidate> narrowCandidates;
 
-        /** Blobs that passed the wide colour box and the motion mask. */
+        /**
+         * Blobs that passed the wide colour box and the motion mask, or with
+         * {@link #USE_BLOB_SVM}, moving blobs the SVM scored at or above its
+         * wide threshold.
+         */
         public final List<BallCandidate> wideCandidates;
 
         /**
@@ -97,6 +117,9 @@ public final class FramePipeline {
     private final ColourDetector wideColourDetector   = ColourDetector.wide();
     private final BlobDetector   narrowBlobDetector   = BlobDetector.narrow();
     private final BlobDetector   wideBlobDetector     = BlobDetector.wide();
+    private final ColourDetector svmColourDetector    = ColourDetector.svmBox();
+    private final SvmBlobDetector svmBlobDetector     =
+            new SvmBlobDetector(ColourDetector.SVM_LO, ColourDetector.SVM_HI);
     private final NetDetector    netDetector          = new NetDetector();
     private final BallTracker    tracker              = new BallTracker();
 
@@ -107,6 +130,7 @@ public final class FramePipeline {
 
     private final Mat narrowBallMask = new Mat();
     private final Mat wideBallMask   = new Mat();
+    private final Mat svmBallMask    = new Mat();
     private final Mat background     = new Mat();
 
     // ---------------------------------------------------------------- run state
@@ -155,15 +179,27 @@ public final class FramePipeline {
             applyReset(timestampUs);
         }
 
-        // Detection: one motion mask, shared by both colour boxes.
+        // Detection: one motion mask, then either the blob SVM or the two colour boxes.
         Mat motionMask = motionDetector.processFrame(yuv);
-        Core.bitwise_and(narrowColourDetector.processFrame(yuv), motionMask, narrowBallMask);
-        Core.bitwise_and(wideColourDetector.processFrame(yuv), motionMask, wideBallMask);
-
-        List<BallCandidate> narrowCandidates =
-                narrowBlobDetector.findCandidates(narrowBallMask, index, timestampUs);
-        List<BallCandidate> wideCandidates =
-                wideBlobDetector.findCandidates(wideBallMask, index, timestampUs);
+        List<BallCandidate> narrowCandidates;
+        List<BallCandidate> wideCandidates;
+        if (USE_BLOB_SVM) {
+            Core.bitwise_and(svmColourDetector.processFrame(yuv),
+                    motionDetector.maskWithShadows(), svmBallMask);
+            List<BallCandidate> scored =
+                    svmBlobDetector.findCandidates(svmBallMask, yuv, index, timestampUs);
+            narrowCandidates = new ArrayList<>();
+            wideCandidates = new ArrayList<>();
+            for (BallCandidate c : scored) {
+                if (c.pBall >= BlobSvm.NARROW_THRESHOLD) narrowCandidates.add(c);
+                if (c.pBall >= BlobSvm.WIDE_THRESHOLD) wideCandidates.add(c);
+            }
+        } else {
+            Core.bitwise_and(narrowColourDetector.processFrame(yuv), motionMask, narrowBallMask);
+            Core.bitwise_and(wideColourDetector.processFrame(yuv), motionMask, wideBallMask);
+            narrowCandidates = narrowBlobDetector.findCandidates(narrowBallMask, index, timestampUs);
+            wideCandidates = wideBlobDetector.findCandidates(wideBallMask, index, timestampUs);
+        }
 
         // Tracking.
         tracker.process(index, timestampUs, narrowCandidates, wideCandidates);
@@ -209,8 +245,11 @@ public final class FramePipeline {
         wideColourDetector.release();
         narrowBlobDetector.release();
         wideBlobDetector.release();
+        svmColourDetector.release();
+        svmBlobDetector.release();
         narrowBallMask.release();
         wideBallMask.release();
+        svmBallMask.release();
         background.release();
     }
 
