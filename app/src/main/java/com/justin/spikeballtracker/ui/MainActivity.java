@@ -12,7 +12,6 @@ import android.widget.Toast;
 import androidx.activity.EdgeToEdge;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
-import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.ContextCompat;
 import androidx.core.graphics.Insets;
@@ -20,9 +19,11 @@ import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
 import com.justin.spikeballtracker.R;
-import com.justin.spikeballtracker.record.ReplayBuffer;
+import com.justin.spikeballtracker.record.RallyFootage;
+import com.justin.spikeballtracker.record.RallySaver;
 import com.justin.spikeballtracker.source.CameraSource;
 import com.justin.spikeballtracker.source.VideoPlayer;
+import com.justin.spikeballtracker.tracking.RallyDetector;
 
 import org.opencv.android.OpenCVLoader;
 import org.opencv.android.Utils;
@@ -31,15 +32,13 @@ import org.opencv.core.Mat;
 import java.util.Locale;
 
 /**
- * Wiring only: two frame sources, one ImageView, and the buttons that switch
- * between them. Anything that touches pixels lives in a source.
+ * Wiring only: two frame sources, one ImageView, the buttons that switch
+ * between them, and the last-rally save. Anything that touches pixels lives
+ * in a source.
  */
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "MainActivity";
-
-    /** The lengths offered by the Save Replay picker. */
-    private static final int[] REPLAY_CHOICES_S = {10, 30, ReplayBuffer.MAX_SAVE_SECONDS};
 
     static {
         if (OpenCVLoader.initLocal()) {
@@ -50,8 +49,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private ImageView frameImageView;
+    private Button saveRallyButton;
     private VideoPlayer videoPlayer;
     private CameraSource cameraSource;
+    private RallySaver rallySaver;
 
     // Activity result contracts must be registered as field initialisers;
     // registering after the activity is STARTED throws.
@@ -84,6 +85,9 @@ public class MainActivity extends AppCompatActivity {
 
         videoPlayer = new VideoPlayer(this);
         cameraSource = new CameraSource(this);
+        rallySaver = new RallySaver(this);
+        videoPlayer.setRallyListener(this::onRally);
+        cameraSource.setRallyListener(this::onRally);
 
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main), (v, insets) -> {
             Insets systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
@@ -111,15 +115,6 @@ public class MainActivity extends AppCompatActivity {
         Button stopButton = findViewById(R.id.stop_video_button);
         stopButton.setOnClickListener(v -> stopAllSources());
 
-        Button exportButton = findViewById(R.id.export_background_button);
-        exportButton.setOnClickListener(v -> {
-            if (videoPlayer.requestBackgroundExport()) {
-                Log.d(TAG, "background export requested");
-            } else {
-                Log.w(TAG, "no video running, nothing to export");
-            }
-        });
-
         Button clearButton = findViewById(R.id.clear_background_button);
         clearButton.setOnClickListener(v -> {
             if (cameraSource.requestBackgroundReset()) {
@@ -129,50 +124,44 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        Button saveReplayButton = findViewById(R.id.save_replay_button);
-        saveReplayButton.setOnClickListener(v -> showSaveReplayDialog());
+        saveRallyButton = findViewById(R.id.save_rally_button);
+        saveRallyButton.setEnabled(rallySaver.hasRally());   // greyed out until the first rally
+        saveRallyButton.setOnClickListener(v -> saveLastRally());
     }
 
     /**
-     * Offers 10 / 30 / 60 s. Asking for more than is buffered saves what there
-     * is; the toast reports the real length.
+     * A source confirmed a rally: keep its footage as the last rally, and
+     * say so briefly. Called on the source's worker thread.
      */
-    private void showSaveReplayDialog() {
-        double buffered = cameraSource.replaySeconds();
-        if (buffered < 1.0) {
-            toast("Nothing recorded yet. Open the camera first.");
-            return;
-        }
-
-        String[] labels = new String[REPLAY_CHOICES_S.length];
-        for (int i = 0; i < labels.length; i++) {
-            labels[i] = "Last " + REPLAY_CHOICES_S[i] + " s";
-        }
-
-        new AlertDialog.Builder(this)
-                .setTitle(String.format(Locale.US, "Save replay (%.0f s buffered)", buffered))
-                .setItems(labels, (dialog, which) ->
-                        cameraSource.saveReplay(REPLAY_CHOICES_S[which],
-                                new ReplayBuffer.SaveCallback() {
-                                    @Override
-                                    public void onSaved(String displayName, double seconds) {
-                                        toast(String.format(Locale.US,
-                                                "Saved %.1f s to Movies/SpikeballTracker/%s",
-                                                seconds, displayName));
-                                    }
-
-                                    @Override
-                                    public void onFailed(String reason) {
-                                        toast("Replay save failed: " + reason);
-                                    }
-                                }))
-                .setNegativeButton(android.R.string.cancel, null)
-                .show();
+    private void onRally(RallyDetector.Rally rally, RallyFootage footage) {
+        rallySaver.keep(footage);
+        double lengthS = (rally.endUs - Math.max(0, rally.startUs)) / 1e6;
+        toast(String.format(Locale.US, "Rally detected · %.1f s", lengthS));
+        runOnUiThread(() -> saveRallyButton.setEnabled(rallySaver.hasRally()));
     }
 
-    /** Safe from any thread; the save callbacks arrive on the save thread. */
+    private void saveLastRally() {
+        rallySaver.saveLast(new RallySaver.SaveCallback() {
+            @Override
+            public void onSaved(String displayName, double seconds) {
+                toast(String.format(Locale.US,
+                        "Saved %.1f s to Movies/SpikeballTracker/%s", seconds, displayName));
+            }
+
+            @Override
+            public void onFailed(String reason) {
+                toast("Rally save failed: " + reason);
+            }
+        });
+    }
+
+    /** Safe from any thread. */
     private void toast(String message) {
-        runOnUiThread(() -> Toast.makeText(this, message, Toast.LENGTH_LONG).show());
+        runOnUiThread(() -> {
+            if (!isFinishing() && !isDestroyed()) {
+                Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+            }
+        });
     }
 
     /**
@@ -199,6 +188,7 @@ public class MainActivity extends AppCompatActivity {
         stopAllSources();
         videoPlayer.release();
         cameraSource.release();
+        rallySaver.release();
         super.onDestroy();
     }
 }

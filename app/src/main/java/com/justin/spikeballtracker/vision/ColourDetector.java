@@ -10,7 +10,16 @@ public class ColourDetector {
     private final Scalar lowerBound;
     private final Scalar upperBound;
 
-    /**
+    //U 43–120, V 130–167 super wide
+    //U 43–87, V 143–167 tighter
+    //U 43–101, V 143–167 looser
+    private static final Scalar NARROW_LO = new Scalar(0, 43, 143);
+    private static final Scalar NARROW_HI = new Scalar(255, 87, 167);
+    private static final Scalar WIDE_LO = new Scalar(0, 43, 130);
+    private static final Scalar WIDE_HI = new Scalar(255, 120, 167);
+
+
+     /**
      * Matches the ball on chroma alone; the luma bounds stay wide open so
      * detection survives shade and direct sun.
      *
@@ -27,15 +36,20 @@ public class ColourDetector {
      * <p>The remap is exact: every value the old bounds accepted lands inside
      * the new ones, and no value they rejected leaks in.
      */
-    public ColourDetector(){
+    private ColourDetector(Scalar lowerBound, Scalar upperBound){
         this.colourMask = new Mat();
-        this.lowerBound = new Scalar(64, 43, 130) ;
-        this.upperBound = new Scalar(224, 120, 167);
+        this.lowerBound = lowerBound;
+        this.upperBound = upperBound;
 
-        //U 43–120, V 130–167 super wide
-        //U 43–87, V 143–167 tighter
 
-        //U 43–101, V 143–167 looser
+    }
+
+    public static ColourDetector narrow(){
+        return new ColourDetector(NARROW_LO, NARROW_HI);
+    }
+
+    public static ColourDetector wide(){
+        return new ColourDetector(WIDE_LO, WIDE_HI);
     }
 
     public Mat processFrame(Mat Frame) {

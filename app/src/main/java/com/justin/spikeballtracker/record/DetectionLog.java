@@ -10,6 +10,8 @@ import android.provider.MediaStore;
 import android.util.Log;
 
 import com.justin.spikeballtracker.tracking.BallCandidate;
+import com.justin.spikeballtracker.tracking.BallTracker;
+import com.justin.spikeballtracker.tracking.RallyDetector;
 
 import org.json.JSONObject;
 import org.opencv.core.Core;
@@ -35,13 +37,13 @@ import java.util.Locale;
  * <p>Files land beside the background plates, in
  * {@code Documents/SpikeballTracker/<runId>/}:
  * <ul>
- *   <li>{@code detections.csv}, one row per processed frame:
+ *   <li>{@code detections_<steam>.csv}, one row per processed frame:
  *   <pre>Frame,TimestampUs,SourceTimestampUs,Candidates,Areas,NetX,NetY,NetW,NetH</pre>
  *   {@code Candidates} is a stringified Python list of {@code (x, y)} tuples,
  *   the format every script in the Python repo already reads with
  *   {@code ast.literal_eval}; {@code Areas} is the matching list of pixel
  *   areas. The net columns are empty until the first lock.</li>
- *   <li>{@code detections_meta.json}: coordinate space, indexing and source,
+ *   <li>{@code stem_meta.json}: coordinate space, indexing and source,
  *   everything needed to line the rows up with the footage.</li>
  * </ul>
  *
@@ -70,7 +72,16 @@ public final class DetectionLog {
     private static final String HEADER =
             "Frame,TimestampUs,SourceTimestampUs,Candidates,Areas,NetX,NetY,NetW,NetH\n";
 
-    /** Describes the run; written once to detections_meta.json. */
+    /** Header of the temporary ball log (detections_ball.csv). Blank X,Y = no ball. */
+    public static final String BALL_HEADER = "Frame,TimestampUs,BallX,BallY\n";
+
+    /**
+     * Header of the rally log (detections_rallies.csv), one row per confirmed
+     * rally. ConfirmedFrame is blank for a rally confirmed when the run ended.
+     */
+    public static final String RALLY_HEADER = "Rally,StartUs,EndUs,StartS,EndS,ConfirmedFrame\n";
+
+    /** Describes the run; written once to stem_meta.json. */
     public static final class Meta {
         public String source = "unknown";        // "video" or "camera"
         public String clipName = "unknown";
@@ -89,6 +100,8 @@ public final class DetectionLog {
     private final Context appContext;
     private final String runId;
     private final Meta meta;
+    private final String stem;
+    private final String header;
 
     private Writer csv = null;
     private Uri csvUri = null;          // API 29+ only
@@ -103,10 +116,74 @@ public final class DetectionLog {
      *              background exporter's id so plates and detections of one
      *              run share a folder
      */
-    public DetectionLog(Context context, String runId, Meta meta) {
+    public DetectionLog(Context context, String runId, Meta meta, String stream) {
+        this(context, runId, meta, stream, HEADER);
+    }
+
+    /**
+     * A log with its own header, for rows built by the caller and written
+     * with {@link #writeRow}. Same folder, storage and failure handling.
+     */
+    public DetectionLog(Context context, String runId, Meta meta, String stream, String header) {
         this.appContext = context.getApplicationContext();
         this.runId = runId;
         this.meta = meta;
+        this.stem = "detections_" + stream;
+        this.header = header;
+    }
+
+    /** TEMPORARY debug log: one row per emitted tracker answer, X and Y blank when there is no ball. */
+    public void writeBall(BallTracker.Output ball) {
+        if (ball == null) {
+            return;   // the tracker has not answered yet (first DELAY frames)
+        }
+        line.setLength(0);
+        line.append(ball.frameIndex + 1).append(',').append(ball.tUs).append(',');
+        if (ball.hasBall) {
+            line.append(fmt(ball.x)).append(',').append(fmt(ball.y));
+        } else {
+            line.append(',');
+        }
+        line.append('\n');
+        writeRow(line.toString());
+    }
+
+    /**
+     * One confirmed rally. Rallies are numbered from 1 in the order they are written.
+     *
+     * @param confirmedFrameIndex pipeline frame index (0-based, written +1) on
+     *                            which it was confirmed, or -1 for the end of the run
+     */
+    public void writeRally(RallyDetector.Rally rally, int confirmedFrameIndex) {
+        line.setLength(0);
+        line.append(rows + 1).append(',')
+                .append(rally.startUs).append(',')
+                .append(rally.endUs).append(',')
+                .append(String.format(Locale.US, "%.3f", rally.startUs / 1e6)).append(',')
+                .append(String.format(Locale.US, "%.3f", rally.endUs / 1e6)).append(',');
+        if (confirmedFrameIndex >= 0) {
+            line.append(confirmedFrameIndex + 1);
+        }
+        line.append('\n');
+        writeRow(line.toString());
+    }
+
+    /** Appends one already-formatted row (must end in a newline). */
+    public void writeRow(String row) {
+        if (failed || closed) {
+            return;
+        }
+        if (csv == null && !open()) {
+            return;
+        }
+        try {
+            csv.write(row);
+            if (++rows % FLUSH_EVERY == 0) {
+                csv.flush();
+            }
+        } catch (IOException e) {
+            fail("CSV write failed", e);
+        }
     }
 
     /** A folder name for runs with no exporter to share one with. */
@@ -125,13 +202,6 @@ public final class DetectionLog {
      */
     public void write(int frameIndex, long timestampUs, long sourceTimestampUs,
                       List<BallCandidate> candidates, Rect netBox) {
-        if (failed || closed) {
-            return;
-        }
-        if (csv == null && !open()) {
-            return;
-        }
-
         line.setLength(0);
         line.append(frameIndex + 1).append(',')
                 .append(timestampUs).append(',')
@@ -154,15 +224,7 @@ public final class DetectionLog {
             line.append(",,,");
         }
         line.append('\n');
-
-        try {
-            csv.write(line.toString());
-            if (++rows % FLUSH_EVERY == 0) {
-                csv.flush();
-            }
-        } catch (IOException e) {
-            fail("CSV write failed", e);
-        }
+        writeRow(line.toString());
     }
 
     /** Flushes and publishes the file. Safe to call more than once. */
@@ -183,7 +245,7 @@ public final class DetectionLog {
             clearPending(csvUri);
         }
         Log.i(TAG, "detections saved: " + rows + " frames in Documents/"
-                + ROOT_FOLDER + "/" + runId + "/detections.csv");
+                + ROOT_FOLDER + "/" + runId + "/" + stem + ".csv");
     }
 
     // --- storage -------------------------------------------------------------
@@ -193,16 +255,16 @@ public final class DetectionLog {
             writeMeta();
             OutputStream os;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                csvUri = insert("detections.csv", "text/csv", true);
+                csvUri = insert(stem + ".csv", "text/csv", true);
                 os = appContext.getContentResolver().openOutputStream(csvUri, "wt");
                 if (os == null) {
                     throw new IOException("no output stream for " + csvUri);
                 }
             } else {
-                os = new FileOutputStream(new File(legacyDir(), "detections.csv"), false);
+                os = new FileOutputStream(new File(legacyDir(), stem + ".csv"), false);
             }
             csv = new BufferedWriter(new OutputStreamWriter(os, StandardCharsets.UTF_8), 64 * 1024);
-            csv.write(HEADER);
+            csv.write(header);
             Log.i(TAG, "logging detections to Documents/" + ROOT_FOLDER + "/" + runId + "/");
             return true;
         } catch (Exception e) {
@@ -219,6 +281,7 @@ public final class DetectionLog {
                 new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.US).format(new Date()));
         root.put("source", meta.source);
         root.put("clipName", meta.clipName);
+        root.put("stream", stem);
 
         JSONObject coords = new JSONObject();
         coords.put("frameWidth", meta.frameWidth);
@@ -259,7 +322,7 @@ public final class DetectionLog {
 
         byte[] bytes = root.toString(2).getBytes(StandardCharsets.UTF_8);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            Uri uri = insert("detections_meta.json", "application/json", false);
+            Uri uri = insert(stem + "_meta.json", "application/json", false);
             try (OutputStream os = appContext.getContentResolver().openOutputStream(uri, "wt")) {
                 if (os == null) {
                     throw new IOException("no output stream for " + uri);
@@ -268,7 +331,7 @@ public final class DetectionLog {
             }
         } else {
             try (FileOutputStream fos =
-                         new FileOutputStream(new File(legacyDir(), "detections_meta.json"))) {
+                         new FileOutputStream(new File(legacyDir(), stem + "_meta.json"))) {
                 fos.write(bytes);
             }
         }
@@ -335,4 +398,4 @@ public final class DetectionLog {
     private static String fmt(double v) {
         return String.format(Locale.US, "%.1f", v);
     }
-}
+}

@@ -1,20 +1,11 @@
 package com.justin.spikeballtracker.record;
 
-import android.content.ContentResolver;
-import android.content.ContentValues;
 import android.content.Context;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
-import android.media.MediaMuxer;
-import android.media.MediaScannerConnection;
-import android.net.Uri;
-import android.os.Build;
-import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
-import android.os.ParcelFileDescriptor;
-import android.provider.MediaStore;
 import android.util.Log;
 import android.util.Size;
 import android.view.Surface;
@@ -23,21 +14,14 @@ import androidx.annotation.NonNull;
 import androidx.camera.core.Preview;
 import androidx.camera.core.SurfaceRequest;
 
-import java.io.File;
-import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.List;
-import java.util.Locale;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 /**
- * Keeps the last minute of camera footage in RAM and saves the last N seconds
- * of it as an MP4 on request.
+ * Keeps the last minute of camera footage in RAM, and copies a confirmed
+ * rally's footage out of it before it is overwritten.
  *
  * <p>How frames get here: a CameraX {@link Preview} use case is bound next to
  * the analysis stream, and its surface is the hardware H.264 encoder's input
@@ -48,58 +32,52 @@ import java.util.concurrent.Executors;
  * frames the analyser saw. Both streams come off the same sensor, on the same
  * clock.
  *
- * <p>The encoder's output goes into an {@link EncodedRing}. Saving remuxes a
- * keyframe-aligned slice of that ring into an MP4 with {@link MediaMuxer}. No
- * re-encode, so a save takes well under a second and costs no quality.
+ * <p>The encoder's output goes into an {@link EncodedRing}, which keeps
+ * overwriting its oldest minute. {@link #copyRally} copies one rally's packets
+ * into a {@link BufferedRally} of their own, which {@link RallySaver} remuxes
+ * into an MP4 with no re-encode.
  *
  * <p>Threads:
  * <ul>
  *   <li><b>encoder thread</b> — surface requests, all MediaCodec callbacks,
  *       session teardown. Owns {@link #current} and {@link #live}.</li>
- *   <li><b>save thread</b> — one save at a time; only reads the ring.</li>
+ *   <li><b>caller of {@link #copyRally}</b> (the camera's analyser thread) —
+ *       only reads the ring, under its lock.</li>
  * </ul>
  *
- * <p>Lifetime: the ring is kept when the camera stops, so the last footage
- * can still be saved afterwards. It is cleared when the next camera session
+ * <p>Lifetime: the ring is kept when the camera stops, so the rally confirmed
+ * at the stop can still be copied. It is cleared when the next camera session
  * starts, because a new encoder's packets cannot be muxed with the old one's
- * stream headers.
+ * stream headers. A rally already copied is unaffected.
  */
 public final class ReplayBuffer {
 
     private static final String TAG = "ReplayBuffer";
 
-    /** The longest clip a save can ask for. */
-    public static final int MAX_SAVE_SECONDS = 60;
+    /**
+     * How much is held: a minute, plus the ~5 s a rally takes to be confirmed
+     * after it ends and the 1 s before it that a clip also keeps. A rally of
+     * up to about a minute can therefore still be copied whole.
+     */
+    private static final long RETAIN_US = 66 * 1_000_000L;
 
     /**
-     * How much is actually held. The margin over MAX_SAVE_SECONDS covers
-     * rounding the start back to a keyframe (up to one GOP) plus the time the
-     * save itself takes, during which the oldest packets keep ageing out.
+     * The recording's newest packet should be within a frame or two of the
+     * newest analysis frame. Further apart than this means the two streams'
+     * timestamps are on different clocks, and the rally is shifted to match.
      */
-    private static final long RETAIN_US = (MAX_SAVE_SECONDS + 6) * 1_000_000L;
+    private static final long CLOCK_MISMATCH_US = 1_000_000L;
 
     private static final String MIME = MediaFormat.MIMETYPE_VIDEO_AVC;
     private static final int BIT_RATE = 5_000_000;          // ~38 MB per minute at 720p
     private static final int FRAME_RATE = 30;               // a hint to the encoder; timestamps rule
-    private static final int I_FRAME_INTERVAL_S = 1;        // save start granularity
+    private static final int I_FRAME_INTERVAL_S = 1;        // clip start granularity
     private static final int MAX_FPS_FOR_SLOTS = 60;        // sizes the packet metadata ring
     private static final double BYTE_HEADROOM = 1.25;       // VBR overshoots on busy scenes
 
-    private static final String FOLDER = "SpikeballTracker";
-
-    public interface SaveCallback {
-        /** Called on the save thread. */
-        void onSaved(String displayName, double seconds);
-
-        /** Called on the save thread. */
-        void onFailed(String reason);
-    }
-
-    private final Context appContext;
     private final HandlerThread encoderThread;
     private final Handler encoderHandler;
     private final Executor encoderExecutor;
-    private final ExecutorService saveExecutor = Executors.newSingleThreadExecutor();
 
     /** Allocated on first use, so an app that never opens the camera never pays ~50 MB. */
     private volatile EncodedRing ring = null;
@@ -112,7 +90,6 @@ public final class ReplayBuffer {
     private final List<Session> live = new ArrayList<>();  // encoder thread only
 
     public ReplayBuffer(Context context) {
-        this.appContext = context.getApplicationContext();
         this.encoderThread = new HandlerThread("ReplayEncoder");
         this.encoderThread.start();
         this.encoderHandler = new Handler(encoderThread.getLooper());
@@ -124,36 +101,58 @@ public final class ReplayBuffer {
         preview.setSurfaceProvider(encoderExecutor, this::onSurfaceRequested);
     }
 
-    /** Seconds of footage currently held; 0 before the first camera session. */
-    public double bufferedSeconds() {
+    /**
+     * Copies the footage from {@code fromUs} to {@code toUs} out of the ring.
+     * The clip starts on the keyframe at or before {@code fromUs} (up to one
+     * second earlier), and is cut short at either end by what the ring holds.
+     *
+     * <p>Takes the ring's lock for the whole copy (a few ms per 10 s of
+     * footage), so the clip and its stream headers always describe the same
+     * camera session.
+     *
+     * @param fromUs start, on the camera's sensor clock (ImageProxy timestamp / 1000)
+     * @param toUs   end, same clock
+     * @param nowUs  the newest analysis frame's time, same clock; used to check
+     *               the recording really is on that clock
+     * @return the copy, or null when the footage is not (or no longer) held
+     */
+    public BufferedRally copyRally(long fromUs, long toUs, long nowUs) {
         EncodedRing r = ring;
-        return r == null ? 0.0 : r.bufferedUs() / 1_000_000.0;
-    }
-
-    /**
-     * Saves the last {@code seconds} (capped at what is held) to
-     * {@code Movies/SpikeballTracker/}. Returns at once; the callback reports
-     * the outcome from the save thread.
-     */
-    public void save(int seconds, SaveCallback callback) {
-        int clamped = Math.max(1, Math.min(seconds, MAX_SAVE_SECONDS));
-        saveExecutor.execute(() -> {
-            try {
-                Saved s = saveBlocking(clamped * 1_000_000L);
-                Log.i(TAG, "saved " + s.name + " (" + s.seconds + " s, "
-                        + s.packets + " packets)");
-                callback.onSaved(s.name, s.seconds);
-            } catch (Exception e) {
-                Log.e(TAG, "replay save failed", e);
-                callback.onFailed(e.getMessage() != null ? e.getMessage() : e.toString());
+        if (r == null) {
+            Log.w(TAG, "nothing recorded; rally footage not kept");
+            return null;
+        }
+        synchronized (r) {
+            if (outputFormat == null || r.count() == 0) {
+                Log.w(TAG, "no encoded footage yet; rally footage not kept");
+                return null;
             }
-        });
+
+            long skewUs = r.newestPtsUs() - nowUs;
+            Log.d(TAG, "recording clock - analysis clock = " + skewUs / 1000 + " ms");
+            if (Math.abs(skewUs) > CLOCK_MISMATCH_US) {
+                Log.w(TAG, "recording and analysis timestamps are " + skewUs / 1000
+                        + " ms apart, more than a clock's worth of latency; "
+                        + "shifting the rally onto the recording's clock");
+                fromUs += skewUs;
+                toUs += skewUs;
+            }
+
+            EncodedRing.Plan plan = r.planRange(fromUs, toUs);
+            EncodedRing.Snapshot packets = plan == null ? null : r.snapshot(plan);
+            if (packets == null) {
+                Log.w(TAG, "rally footage is no longer in the ring; not kept");
+                return null;
+            }
+            if (plan.firstPtsUs > fromUs) {
+                Log.w(TAG, "rally began before the oldest footage held; the clip starts "
+                        + (plan.firstPtsUs - fromUs) / 1000 + " ms late");
+            }
+            return new BufferedRally(packets, outputFormat, rotationDegrees);
+        }
     }
 
-    /**
-     * Stops any encoder and the worker threads. A save already running is
-     * allowed to finish: {@code shutdown}, not {@code shutdownNow}.
-     */
+    /** Stops any encoder and the encoder thread. */
     public void release() {
         encoderHandler.post(() -> {
             for (Session s : new ArrayList<>(live)) {
@@ -162,7 +161,6 @@ public final class ReplayBuffer {
             current = null;
         });
         encoderThread.quitSafely();
-        saveExecutor.shutdown();
     }
 
     // --- encoder side (encoder thread) ---------------------------------------
@@ -318,167 +316,6 @@ public final class ReplayBuffer {
             codec.release();
             if (surface != null) {
                 surface.release();
-            }
-        }
-    }
-
-    // --- save side (save thread) ---------------------------------------------
-
-    private static final class Saved {
-        String name;
-        double seconds;
-        int packets;
-    }
-
-    private Saved saveBlocking(long durationUs) throws IOException {
-        EncodedRing r = ring;
-        if (r == null) {
-            throw new IOException("nothing recorded yet");
-        }
-
-        // Format and plan must describe the same session, so take both under the
-        // same lock that a new session's clear() takes.
-        MediaFormat format;
-        EncodedRing.Plan plan;
-        synchronized (r) {
-            format = outputFormat;
-            plan = r.plan(durationUs);
-        }
-        if (format == null || plan == null) {
-            throw new IOException("nothing buffered yet");
-        }
-        int rotation = rotationDegrees;
-
-        String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date());
-        long seconds = Math.round(plan.durationUs() / 1_000_000.0);
-        String name = "replay_" + stamp + "_" + seconds + "s.mp4";
-
-        ByteBuffer scratch = ByteBuffer.allocateDirect(Math.max(r.maxPacketSize(), 64 * 1024));
-        EncodedRing.Packet packet = new EncodedRing.Packet();
-        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-
-        Output out = Output.open(appContext, name);
-        MediaMuxer muxer = null;
-        boolean ok = false;
-        int written = 0;
-        try {
-            muxer = out.newMuxer();
-            muxer.setOrientationHint(rotation);
-            int track = muxer.addTrack(format);
-            muxer.start();
-
-            for (long seq = plan.startSeq; seq < plan.endSeq; seq++) {
-                if (!r.copy(seq, scratch, packet)) {
-                    // Evicted underneath us: the camera restarted mid-save, or
-                    // the save ran slower than the retention margin allows.
-                    throw new IOException("buffer was overwritten during the save");
-                }
-                // Rebased to zero: camera timestamps count from device boot.
-                info.set(0, packet.size, packet.ptsUs - plan.firstPtsUs,
-                        packet.keyFrame ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0);
-                muxer.writeSampleData(track, scratch, info);
-                written++;
-            }
-
-            muxer.stop();
-            ok = true;
-        } finally {
-            if (muxer != null) {
-                try {
-                    muxer.release();
-                } catch (IllegalStateException e) {
-                    Log.w(TAG, "muxer release failed", e);
-                }
-            }
-            out.finish(ok);
-        }
-
-        Saved s = new Saved();
-        s.name = name;
-        s.seconds = plan.durationUs() / 1_000_000.0;
-        s.packets = written;
-        return s;
-    }
-
-    /**
-     * Where one MP4 goes: a pending MediaStore entry on API 29+, a plain file in
-     * the public Movies folder below that. Same split as BackgroundExporter.
-     */
-    private static final class Output {
-        private final Context ctx;
-        private Uri uri;
-        private ParcelFileDescriptor pfd;
-        private File file;
-
-        private Output(Context ctx) {
-            this.ctx = ctx;
-        }
-
-        static Output open(Context ctx, String name) throws IOException {
-            Output o = new Output(ctx);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ContentResolver resolver = ctx.getContentResolver();
-                ContentValues cv = new ContentValues();
-                cv.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
-                cv.put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4");
-                cv.put(MediaStore.MediaColumns.RELATIVE_PATH,
-                        Environment.DIRECTORY_MOVIES + File.separator + FOLDER);
-                cv.put(MediaStore.MediaColumns.IS_PENDING, 1);
-                o.uri = resolver.insert(
-                        MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), cv);
-                if (o.uri == null) {
-                    throw new IOException("MediaStore insert returned null for " + name);
-                }
-                // MP4 writing seeks back to patch the header, so the fd must be read-write.
-                o.pfd = resolver.openFileDescriptor(o.uri, "rw");
-                if (o.pfd == null) {
-                    resolver.delete(o.uri, null, null);
-                    throw new IOException("could not open " + o.uri);
-                }
-            } else {
-                File dir = new File(
-                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
-                        FOLDER);
-                //noinspection ResultOfMethodCallIgnored
-                dir.mkdirs();
-                o.file = new File(dir, name);
-            }
-            return o;
-        }
-
-        MediaMuxer newMuxer() throws IOException {
-            int fmt = MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4;
-            return pfd != null
-                    ? new MediaMuxer(pfd.getFileDescriptor(), fmt)
-                    : new MediaMuxer(file.getAbsolutePath(), fmt);
-        }
-
-        /** Publishes the file on success; deletes the partial one on failure. */
-        void finish(boolean ok) {
-            if (pfd != null) {
-                try {
-                    pfd.close();
-                } catch (IOException e) {
-                    Log.w(TAG, "fd close failed", e);
-                }
-            }
-            if (uri != null) {
-                ContentResolver resolver = ctx.getContentResolver();
-                if (ok) {
-                    ContentValues cv = new ContentValues();
-                    cv.put(MediaStore.MediaColumns.IS_PENDING, 0);
-                    resolver.update(uri, cv, null, null);
-                } else {
-                    resolver.delete(uri, null, null);
-                }
-            } else if (file != null) {
-                if (ok) {
-                    MediaScannerConnection.scanFile(ctx,
-                            new String[]{file.getAbsolutePath()}, new String[]{"video/mp4"}, null);
-                } else {
-                    //noinspection ResultOfMethodCallIgnored
-                    file.delete();
-                }
             }
         }
     }

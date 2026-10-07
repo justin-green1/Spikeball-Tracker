@@ -18,6 +18,8 @@ import androidx.core.content.ContextCompat;
 import androidx.lifecycle.LifecycleOwner;
 
 import com.google.common.util.concurrent.ListenableFuture;
+import com.justin.spikeballtracker.record.BufferedRally;
+import com.justin.spikeballtracker.record.RallyFootage;
 import com.justin.spikeballtracker.record.ReplayBuffer;
 import com.justin.spikeballtracker.video.FrameExtractor;
 import com.justin.spikeballtracker.video.YuvFrameBuilder;
@@ -27,11 +29,14 @@ import org.opencv.core.Core;
 import org.opencv.core.Mat;
 import org.opencv.imgproc.Imgproc;
 
+import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import com.justin.spikeballtracker.record.DetectionLog;
+import com.justin.spikeballtracker.tracking.BallTracker;
+import com.justin.spikeballtracker.tracking.RallyDetector;
 import com.justin.spikeballtracker.vision.MotionDetector;
 
 /**
@@ -48,7 +53,8 @@ import com.justin.spikeballtracker.vision.MotionDetector;
  *
  * <p>A second use case, {@link Preview}, runs alongside the analysis stream and
  * feeds {@link ReplayBuffer}'s encoder, which holds the last minute of 720p
- * footage for {@link #saveReplay}. The two streams are independent: a slow
+ * footage. Each confirmed rally's footage is copied out of it, so the rally
+ * survives the minute rolling on. The two streams are independent: a slow
  * pipeline drops analysis frames but never recorded ones.
  */
 public final class CameraSource {
@@ -70,37 +76,59 @@ public final class CameraSource {
     private final YuvFrameBuilder yuvBuilder = new YuvFrameBuilder();
     private final Mat rgb = new Mat();
     private final Mat rotated = new Mat();
-    private final AtomicInteger frameCounter = new AtomicInteger();
 
     private ProcessCameraProvider cameraProvider = null;
     /**
-     * One camera session's pipeline and its detection log. Swapped as a unit
+     * One camera session's pipeline, logs and clock. Swapped as a unit
      * through a single volatile field, so a frame can never be processed by one
      * session's pipeline and logged into another session's file.
      */
     private static final class Run {
         final FramePipeline pipeline;
-        final DetectionLog log;
+        final DetectionLog wideLog;
+        final DetectionLog narrowLog;
+        final DetectionLog ballLog;   // TEMPORARY debug
+        final DetectionLog rallyLog;
 
-        Run(FramePipeline pipeline, DetectionLog log) {
+        /**
+         * Sensor time of this session's first and newest frames, in ns.
+         * Analyser thread only. The pipeline's timestamps count from the
+         * first; the replay ring is stamped with raw sensor time.
+         */
+        long firstTimestampNs = -1L;
+        long lastTimestampNs = -1L;
+
+        Run(FramePipeline pipeline, DetectionLog narrowlog, DetectionLog wideLog,
+            DetectionLog ballLog, DetectionLog rallyLog) {
             this.pipeline = pipeline;
-            this.log = log;
+            this.wideLog = wideLog;
+            this.narrowLog = narrowlog;
+            this.ballLog = ballLog;
+            this.rallyLog = rallyLog;
         }
 
-        /** Analyser thread only: both hold state that thread was using. */
+        /** Analyser thread only: all of these hold state that thread was using. */
         void release() {
             pipeline.release();
-            log.close();
+            wideLog.close();
+            narrowLog.close();
+            ballLog.close();
+            rallyLog.close();
         }
     }
 
     private volatile Run run = null;
     private volatile FrameSink sink = null;
-    private long firstTimestampNs = 0L;   // analyser thread only
+    private volatile RallyListener rallyListener = null;
 
     public CameraSource(Context context) {
         this.appContext = context.getApplicationContext();
         this.replayBuffer = new ReplayBuffer(appContext);
+    }
+
+    /** Told about each confirmed rally, with its footage, on the camera thread; null for none. */
+    public void setRallyListener(RallyListener listener) {
+        this.rallyListener = listener;
     }
 
     public boolean isRunning() {
@@ -146,7 +174,6 @@ public final class CameraSource {
                 replayBuffer.attachTo(recording);
 
                 cameraProvider.unbindAll();
-                frameCounter.set(0);
                 replaceRun(newRun());
 
                 try {
@@ -202,15 +229,26 @@ public final class CameraSource {
     }
 
     /**
-     * Swaps the session, releasing the old pipeline and closing the old log on
-     * the thread that used them. The close is queued behind any frame still in
-     * flight, so that frame's row is written before the file is published.
+     * Swaps the session, finishing the old one's rallies, releasing its
+     * pipeline and closing its logs on the thread that used them. The close
+     * is queued behind any frame still in flight, so that frame's row is
+     * written before the file is published.
      */
     private void replaceRun(Run next) {
         Run previous = run;
         run = next;
         if (previous != null) {
-            cameraExecutor.execute(previous::release);
+            RallyListener listener = rallyListener;
+            cameraExecutor.execute(() -> {
+                // A rally still in progress is confirmed now. The ring is kept
+                // after the camera stops, so its footage can still be copied.
+                try {
+                    reportRallies(previous, previous.pipeline.finish(), -1, listener);
+                } catch (Exception e) {
+                    Log.e(TAG, "rally finish failed", e);
+                }
+                previous.release();
+            });
         }
     }
 
@@ -230,8 +268,31 @@ public final class CameraSource {
         m.knnPreBlurKernel = MotionDetector.preBlurKernel();
         m.note = "analysis frames are resized to the working frame regardless of the "
                 + "camera's aspect ratio; frames dropped by KEEP_ONLY_LATEST have no row";
-        return new Run(new FramePipeline(true),
-                new DetectionLog(appContext, DetectionLog.newRunId("camera"), m));
+        // One id, so all three files land in the same folder even if the clock
+        // ticks over between calls.
+        String runId = DetectionLog.newRunId("camera");
+
+        DetectionLog.Meta ballMeta = new DetectionLog.Meta();
+        ballMeta.source = "camera";
+        ballMeta.clipName = "camera";
+        ballMeta.frameWidth = m.frameWidth;
+        ballMeta.frameHeight = m.frameHeight;
+        ballMeta.note = "ball tracker output, emitted " + BallTracker.DELAY
+                + " processed frames late; blank BallX,BallY = no ball";
+
+        DetectionLog.Meta rallyMeta = new DetectionLog.Meta();
+        rallyMeta.source = "camera";
+        rallyMeta.clipName = "camera";
+        rallyMeta.frameWidth = m.frameWidth;
+        rallyMeta.frameHeight = m.frameHeight;
+        rallyMeta.note = "one row per confirmed rally; times are microseconds since the "
+                + "camera's first frame (TimestampUs in the other logs)";
+
+        return new Run(new FramePipeline(),
+                new DetectionLog(appContext, runId, m, "narrow"),
+                new DetectionLog(appContext, runId, m, "wide"),
+                new DetectionLog(appContext, runId, ballMeta, "ball", DetectionLog.BALL_HEADER),
+                new DetectionLog(appContext, runId, rallyMeta, "rallies", DetectionLog.RALLY_HEADER));
     }
 
     @OptIn(markerClass = ExperimentalGetImage.class)
@@ -254,25 +315,31 @@ public final class CameraSource {
             // getTimestamp() is nanoseconds from an arbitrary epoch. Rebasing on
             // the first frame is what makes the pipeline's ten-second initial
             // net delay mean "ten seconds after the camera opened".
-            int index = frameCounter.getAndIncrement();
             long tsNs = proxy.getImageInfo().getTimestamp();
-            if (index == 0) {
-                firstTimestampNs = tsNs;
+            if (current.firstTimestampNs < 0) {
+                current.firstTimestampNs = tsNs;
             }
-            long timestampUs = (tsNs - firstTimestampNs) / 1_000L;
+            current.lastTimestampNs = tsNs;
+            long timestampUs = (tsNs - current.firstTimestampNs) / 1_000L;
 
             long t0 = System.nanoTime();
-            FramePipeline.Result r = current.pipeline.process(yuv, timestampUs, rgb, false);
+            FramePipeline.Result r = current.pipeline.process(yuv, timestampUs, rgb);
             long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
 
             // Sensor time is the clock the replay encoder also stamps its frames
             // with, so it is what lines these rows up with a saved replay later.
-            current.log.write(r.frameIndex, timestampUs, tsNs / 1_000L,
-                    r.candidates, r.netBox);
+            current.wideLog.write(r.frameIndex, timestampUs, tsNs / 1_000L,
+                    r.wideCandidates, r.netBox);
+            current.narrowLog.write(r.frameIndex, timestampUs, tsNs / 1_000L,
+                    r.narrowCandidates, r.netBox);
+            current.ballLog.writeBall(r.ball);
+            reportRallies(current, r.newRallies, r.frameIndex, rallyListener);
 
-            if (index % 30 == 0) {
-                Log.d(TAG, "frame " + index + " " + elapsedMs + "ms"
-                        + " cands=" + r.candidates.size()
+
+            if (r.frameIndex % 30 == 0) {
+                Log.d(TAG, "frame " + r.frameIndex + " " + elapsedMs + "ms"
+                        + "wide cands=" + r.wideCandidates.size()
+                        + "narrow cands=" + r.narrowCandidates.size()
                         + " net=" + r.netBox);
             }
 
@@ -283,6 +350,42 @@ public final class CameraSource {
         } finally {
             proxy.close();   // without this the buffer pool drains and the stream stops
         }
+    }
+
+    /**
+     * Logs each rally and, if anyone is listening, copies its footage out of
+     * the replay ring and hands both over. Analyser thread only.
+     *
+     * <p>The copy is a few ms per 10 s of rally, taken once per rally, seconds
+     * after it ended; at worst the analyser drops a frame for it.
+     */
+    private void reportRallies(Run run, List<RallyDetector.Rally> rallies, int frameIndex,
+                               RallyListener listener) {
+        for (RallyDetector.Rally rally : rallies) {
+            Log.i(TAG, String.format(Locale.US, "rally confirmed: %.2f s to %.2f s",
+                    rally.startUs / 1e6, rally.endUs / 1e6));
+            run.rallyLog.writeRally(rally, frameIndex);
+            if (listener != null) {
+                listener.onRally(rally, copyFootage(run, rally));
+            }
+        }
+    }
+
+    /** The rally plus its margins, from the ring; null if the ring no longer has it. */
+    private RallyFootage copyFootage(Run run, RallyDetector.Rally rally) {
+        // Pipeline time counts from the session's first frame; the ring is on raw sensor time.
+        long baseUs = run.firstTimestampNs / 1_000L;
+        long t0 = System.nanoTime();
+        BufferedRally footage = replayBuffer.copyRally(
+                baseUs + rally.startUs - RallyFootage.BEFORE_US,
+                baseUs + rally.endUs + RallyFootage.AFTER_US,
+                run.lastTimestampNs / 1_000L);
+        if (footage != null) {
+            Log.d(TAG, String.format(Locale.US, "rally footage kept: %.1f s, %.1f MB, copied in %d ms",
+                    footage.durationUs() / 1e6, footage.sizeBytes() / 1e6,
+                    (System.nanoTime() - t0) / 1_000_000L));
+        }
+        return footage;
     }
 
     /**
@@ -313,18 +416,5 @@ public final class CameraSource {
         }
         current.pipeline.requestReset();
         return true;
-    }
-
-    /**
-     * Seconds of footage available to {@link #saveReplay}. Still valid after
-     * {@link #stop()}; the buffer is only cleared when the camera next starts.
-     */
-    public double replaySeconds() {
-        return replayBuffer.bufferedSeconds();
-    }
-
-    /** Saves the last {@code seconds} of camera footage as an MP4. Returns at once. */
-    public void saveReplay(int seconds, ReplayBuffer.SaveCallback callback) {
-        replayBuffer.save(seconds, callback);
     }
 }

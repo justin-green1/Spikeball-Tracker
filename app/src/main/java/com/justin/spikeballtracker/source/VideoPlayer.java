@@ -5,16 +5,18 @@ import android.net.Uri;
 import android.util.Log;
 
 import com.justin.spikeballtracker.record.DetectionLog;
-import com.justin.spikeballtracker.tracking.BallCandidate;
-import com.justin.spikeballtracker.video.BackgroundExporter;
+import com.justin.spikeballtracker.record.FileRally;
+import com.justin.spikeballtracker.record.RallyFootage;
+import com.justin.spikeballtracker.tracking.BallTracker;
+import com.justin.spikeballtracker.tracking.RallyDetector;
 import com.justin.spikeballtracker.video.FrameExtractor;
 import com.justin.spikeballtracker.vision.FramePipeline;
 import com.justin.spikeballtracker.vision.MotionDetector;
 
 import org.opencv.core.Mat;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -24,11 +26,11 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Plays a recorded clip through the pipeline at its true frame rate.
  *
- * <p>Owns the extractor and the background exporter, because it is the only
- * path that produces exportable plates.
+ * <p>Every clip writes its {@link DetectionLog}s (narrow and wide candidates,
+ * ball, rallies) into one run folder under {@code Documents/SpikeballTracker/}.
  *
- * <p>Every clip also writes a {@link DetectionLog}, the per-frame ball
- * candidates and net box, into the same run folder as its plates.
+ * <p>A confirmed rally's footage is a {@link FileRally}: a time range of the
+ * clip itself, cut out only if it is saved.
  */
 public final class VideoPlayer {
 
@@ -36,21 +38,22 @@ public final class VideoPlayer {
 
     private final Context appContext;
     private final FrameExtractor frameExtractor;
-    private final BackgroundExporter backgroundExporter;
 
     /** One clip at a time; a task holds this thread for the whole clip. */
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
-    /** Set by the export button, consumed on the processing thread. */
-    private final AtomicBoolean exportRequested = new AtomicBoolean(false);
-
     private volatile Future<?> activeTask = null;
     private volatile AtomicBoolean activeCancelFlag = null;
+    private volatile RallyListener rallyListener = null;
 
     public VideoPlayer(Context context) {
         this.appContext = context.getApplicationContext();
         this.frameExtractor = new FrameExtractor(context);
-        this.backgroundExporter = new BackgroundExporter(context);
+    }
+
+    /** Told about each confirmed rally of a clip that plays to the end; null for none. */
+    public void setRallyListener(RallyListener listener) {
+        this.rallyListener = listener;
     }
 
     public void play(Uri videoUri, FrameSink sink) {
@@ -63,10 +66,11 @@ public final class VideoPlayer {
             FramePipeline pipeline = new FramePipeline();
             Mat displayMat = new Mat();
             PlaybackClock clock = new PlaybackClock();
-            List<BallCandidate> allCandidates = new ArrayList<>();
+            final int[] candidateCounts = new int[2];   // narrow, wide; for the end-of-clip log line
+
             final AtomicBoolean firstFrame = new AtomicBoolean(true);
-            // Set on the first frame, once the export run (and so the folder) exists.
-            final AtomicReference<DetectionLog> log = new AtomicReference<>(null);
+            // Set on the first frame, once the clip's colour info is known.
+            final AtomicReference<Logs> logs = new AtomicReference<>(null);
 
             try {
                 frameExtractor.streamFrames(videoUri, (frame, timestampUs) -> {
@@ -75,44 +79,42 @@ public final class VideoPlayer {
                     }
 
                     if (firstFrame.getAndSet(false)) {
-                        beginExportRun(videoUri, frame);
-                        log.set(newDetectionLog(videoUri, frame));
+                        logs.set(new Logs(videoUri, frame));
                     }
 
-                    boolean manual = exportRequested.getAndSet(false);
-                    boolean plateWanted =
-                            manual || backgroundExporter.dueForBackground(timestampUs);
-
-                    FramePipeline.Result r =
-                            pipeline.process(frame, timestampUs, displayMat, plateWanted);
-                    allCandidates.addAll(r.candidates);
+                    FramePipeline.Result r = pipeline.process(frame, timestampUs, displayMat);
+                    candidateCounts[0] += r.narrowCandidates.size();
+                    candidateCounts[1] += r.wideCandidates.size();
 
                     // For video the pipeline's timestamp is the PTS itself.
-                    log.get().write(r.frameIndex, timestampUs, timestampUs,
-                            r.candidates, r.netBox);
-
-                    // offerFrame no longer writes anything, so it can run after
-                    // process(); that lets the pipeline own frame numbering.
-                    backgroundExporter.offerFrame(frame, r.frameIndex, timestampUs);
-                    if (r.backgroundPlate != null) {
-                        backgroundExporter.offerBackground(
-                                r.backgroundPlate, r.frameIndex, timestampUs);
-                        if (manual) {
-                            backgroundExporter.exportPlate(
-                                    r.backgroundPlate, "manual", r.frameIndex, timestampUs);
-                        }
-                    }
+                    Logs l = logs.get();
+                    l.narrow.write(r.frameIndex, timestampUs, timestampUs,
+                            r.narrowCandidates, r.netBox);
+                    l.wide.write(r.frameIndex, timestampUs, timestampUs,
+                            r.wideCandidates, r.netBox);
+                    l.ball.writeBall(r.ball);
+                    reportRallies(r.newRallies, r.frameIndex, l.rallies, videoUri, rallyListener);
 
                     sink.onDisplayFrame(displayMat);
                     return clock.waitFor(timestampUs);
                 });
             } finally {
-                DetectionLog l = log.get();
+                Logs l = logs.get();
+
+                // The last rally is only confirmed once the clip is over. A
+                // stopped clip still logs it, but tells no one.
+                try {
+                    reportRallies(pipeline.finish(), -1, l == null ? null : l.rallies,
+                            videoUri, cancelled.get() ? null : rallyListener);
+                } catch (Exception e) {
+                    Log.e(TAG, "rally finish failed", e);
+                }
+
                 if (l != null) {
                     l.close();
                 }
-                backgroundExporter.endRun();
-                Log.d(TAG, "total candidates: " + allCandidates.size()
+                Log.d(TAG, "narrow candidates: " + candidateCounts[0]
+                        + ", wide candidates: " + candidateCounts[1]
                         + ", worst playback lag: " + clock.worstLagMs() + "ms");
                 pipeline.release();
                 displayMat.release();
@@ -139,55 +141,84 @@ public final class VideoPlayer {
         activeTask = null;
     }
 
-    /** @return false when no run is active, so there is nothing to export. */
-    public boolean requestBackgroundExport() {
-        if (!backgroundExporter.isRunActive()) {
-            return false;
-        }
-        exportRequested.set(true);
-        return true;
-    }
-
     public void release() {
         stop();
         executor.shutdownNow();
         frameExtractor.release();
     }
 
-    private void beginExportRun(Uri videoUri, Mat firstFrame) {
-        // readColourInfo has run by now, so the provenance recorded is the one
-        // actually in force for this clip.
-        FrameExtractor.ColourInfo colour = frameExtractor.colourInfo();
-        BackgroundExporter.Provenance p = new BackgroundExporter.Provenance();
-        p.clipName = videoUri.getLastPathSegment();
-        p.colourRange = colour.range;
-        p.colourStandard = colour.standard;
-        p.expandToFullRange = colour.expandToFullRange;
-        p.targetWidth = firstFrame.cols();
-        p.targetHeight = firstFrame.rows();
-        p.knnHistory = MotionDetector.history();
-        p.knnDist2Threshold = MotionDetector.dist2Threshold();
-        p.knnDetectShadows = MotionDetector.detectShadows();
-        p.knnPreBlurKernel = MotionDetector.preBlurKernel();
-        backgroundExporter.beginRun(p);
+    /** Logs each rally and hands it, with its footage range, to the listener if there is one. */
+    private void reportRallies(List<RallyDetector.Rally> rallies, int frameIndex,
+                               DetectionLog log, Uri videoUri, RallyListener listener) {
+        for (RallyDetector.Rally rally : rallies) {
+            Log.i(TAG, String.format(Locale.US, "rally confirmed: %.2f s to %.2f s",
+                    rally.startUs / 1e6, rally.endUs / 1e6));
+            if (log != null) {
+                log.writeRally(rally, frameIndex);
+            }
+            if (listener != null) {
+                RallyFootage footage = new FileRally(appContext, videoUri,
+                        Math.max(0L, rally.startUs - RallyFootage.BEFORE_US),
+                        rally.endUs + RallyFootage.AFTER_US);
+                listener.onRally(rally, footage);
+            }
+        }
     }
 
-    /** Called after beginExportRun, so it can share the run's folder. */
-    private DetectionLog newDetectionLog(Uri videoUri, Mat firstFrame) {
-        FrameExtractor.ColourInfo colour = frameExtractor.colourInfo();
-        DetectionLog.Meta m = new DetectionLog.Meta();
-        m.source = "video";
-        m.clipName = videoUri.getLastPathSegment();
-        m.frameWidth = firstFrame.cols();
-        m.frameHeight = firstFrame.rows();
-        m.colourRange = colour.range;
-        m.colourStandard = colour.standard;
-        m.expandToFullRange = colour.expandToFullRange;
-        m.knnHistory = MotionDetector.history();
-        m.knnDist2Threshold = MotionDetector.dist2Threshold();
-        m.knnDetectShadows = MotionDetector.detectShadows();
-        m.knnPreBlurKernel = MotionDetector.preBlurKernel();
-        return new DetectionLog(appContext, backgroundExporter.runId(), m);
+    /** One clip's four logs, sharing one run folder. Playback thread only. */
+    private final class Logs {
+        final DetectionLog narrow;
+        final DetectionLog wide;
+        final DetectionLog ball;
+        final DetectionLog rallies;
+
+        Logs(Uri videoUri, Mat firstFrame) {
+            String clipName = videoUri.getLastPathSegment();
+            String runId = DetectionLog.newRunId(clipName);
+            FrameExtractor.ColourInfo colour = frameExtractor.colourInfo();
+
+            DetectionLog.Meta m = new DetectionLog.Meta();
+            m.source = "video";
+            m.clipName = clipName;
+            m.frameWidth = firstFrame.cols();
+            m.frameHeight = firstFrame.rows();
+            m.colourRange = colour.range;
+            m.colourStandard = colour.standard;
+            m.expandToFullRange = colour.expandToFullRange;
+            m.knnHistory = MotionDetector.history();
+            m.knnDist2Threshold = MotionDetector.dist2Threshold();
+            m.knnDetectShadows = MotionDetector.detectShadows();
+            m.knnPreBlurKernel = MotionDetector.preBlurKernel();
+            narrow = new DetectionLog(appContext, runId, m, "narrow");
+            wide = new DetectionLog(appContext, runId, m, "wide");
+
+            DetectionLog.Meta ballMeta = basicMeta(clipName, firstFrame);
+            ballMeta.note = "ball tracker output, emitted " + BallTracker.DELAY
+                    + " frames late; blank BallX,BallY = no ball; last " + BallTracker.DELAY
+                    + " frames of a clip are never emitted";
+            ball = new DetectionLog(appContext, runId, ballMeta, "ball", DetectionLog.BALL_HEADER);
+
+            DetectionLog.Meta rallyMeta = basicMeta(clipName, firstFrame);
+            rallyMeta.note = "one row per confirmed rally; times are the clip's presentation time";
+            rallies = new DetectionLog(appContext, runId, rallyMeta, "rallies",
+                    DetectionLog.RALLY_HEADER);
+        }
+
+        private DetectionLog.Meta basicMeta(String clipName, Mat firstFrame) {
+            DetectionLog.Meta m = new DetectionLog.Meta();
+            m.source = "video";
+            m.clipName = clipName;
+            m.frameWidth = firstFrame.cols();
+            m.frameHeight = firstFrame.rows();
+            return m;
+        }
+
+        void close() {
+            narrow.close();
+            wide.close();
+            ball.close();
+            rallies.close();
+        }
     }
 
     /**
