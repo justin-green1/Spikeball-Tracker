@@ -1,5 +1,7 @@
 package com.justin.spikeballtracker.vision;
 
+import android.util.Log;
+
 import com.justin.spikeballtracker.tracking.BallCandidate;
 
 import org.opencv.core.Mat;
@@ -8,6 +10,11 @@ import org.opencv.imgproc.Imgproc;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * Connected components of the widened-box ball mask, each scored by
@@ -18,29 +25,88 @@ import java.util.List;
  * features cannot be computed (fewer than 3 in-box pixels, which the study
  * skipped) get P(ball) = 0.
  *
- * <p>The SVM was trained on 40-400 px blobs only. The floor here is 15, as
- * the narrow stream used, so 15-39 px blobs are scored outside the range the
- * model has seen.
+ * <p>The SVM was trained on 40-400 px blobs only. The floor here is
+ * {@link #MIN_AREA}, so smaller blobs are scored outside the range the model
+ * has seen. Raising it is also the simplest way to cut cost: on S3C01 there are
+ * ~140 blobs a frame at 15 px, ~110 at 20, ~60 at 40.
  *
- * <p>Owns reusable Mats, so one instance belongs to one thread.
+ * <p>Cost: the frame and the label image are read out of OpenCV once per
+ * frame, and everything per blob is plain Java ({@link BlobFeatures}, then
+ * {@link BlobSvm}). Busy frames are split across worker threads plus the
+ * calling one; results are the same as single-threaded and in the same order.
+ * The default is {@link #DEFAULT_WORKERS} workers (up to 3, leaving two cores
+ * for the decoder and UI). Every {@link #LOG_EVERY} frames the mean blob count
+ * and time per frame are logged under this class's tag.
+ *
+ * <p>Owns reusable buffers and a thread pool: one instance belongs to one
+ * pipeline thread, and {@link #release()} stops the pool.
  */
 public final class SvmBlobDetector {
+
+    private static final String TAG = "SvmBlobDetector";
 
     public static final int MIN_AREA = 15;
     public static final int MAX_AREA = 400;
 
+    /** Default extra threads for busy frames; the calling thread takes a share too. */
+    public static final int DEFAULT_WORKERS =
+            Math.max(0, Math.min(3, Runtime.getRuntime().availableProcessors() - 2));
+
+    /** Below this many blobs a frame is scored on the calling thread alone. */
+    private static final int PARALLEL_MIN_BLOBS = 24;
+
+    /** Frames between timing log lines. */
+    private static final int LOG_EVERY = 150;
+
     private final Mat labels = new Mat();
     private final Mat stats = new Mat();
     private final Mat centroids = new Mat();
-    private final BlobFeatures features;
-    private final double[] f = new double[BlobSvm.N_FEATURES];
+
+    private final int workers;
+
+    /** One per share: [0] is the calling thread's, [1..workers] the workers'. */
+    private final BlobFeatures[] features;
+    private final double[][] f;
+    private final ExecutorService pool;
+    private final List<Future<?>> pending = new ArrayList<>();
+
+    private byte[] yuvBytes = new byte[0];
+    private int[] labelInts = new int[0];
+    private int[] st = new int[0];
+    private double[] ce = new double[0];
+    private int[] todo = new int[0];
+    private double[] prob = new double[0];
+
+    private long timedNanos = 0;
+    private long timedBlobs = 0;
+    private int timedFrames = 0;
+    private long worstNanos = 0;
 
     /**
      * @param boxLo the colour box the mask was cut with, lower Y,U,V bound
      * @param boxHi upper bound, inclusive
      */
     public SvmBlobDetector(Scalar boxLo, Scalar boxHi) {
-        features = new BlobFeatures(boxLo, boxHi);
+        this(boxLo, boxHi, DEFAULT_WORKERS);
+    }
+
+    /**
+     * @param workers extra scoring threads; 0 scores everything on the calling thread
+     */
+    public SvmBlobDetector(Scalar boxLo, Scalar boxHi, int workers) {
+        this.workers = Math.max(0, workers);
+        features = new BlobFeatures[this.workers + 1];
+        f = new double[this.workers + 1][BlobSvm.N_FEATURES];
+        int[] lo = {(int) boxLo.val[0], (int) boxLo.val[1], (int) boxLo.val[2]};
+        int[] hi = {(int) boxHi.val[0], (int) boxHi.val[1], (int) boxHi.val[2]};
+        for (int k = 0; k <= this.workers; k++) {
+            features[k] = new BlobFeatures(lo, hi);
+        }
+        pool = this.workers == 0 ? null : Executors.newFixedThreadPool(this.workers, r -> {
+            Thread t = new Thread(r, "svm-blob");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     /**
@@ -49,42 +115,103 @@ public final class SvmBlobDetector {
      * @return every component of {@link #MIN_AREA}-{@link #MAX_AREA} px, scored
      */
     public List<BallCandidate> findCandidates(Mat mask, Mat yuv, int frameIndex, long timestampUs) {
+        long t0 = System.nanoTime();
         int count = Imgproc.connectedComponentsWithStats(mask, labels, stats, centroids);
         List<BallCandidate> out = new ArrayList<>();
-        if (count <= 1) {
-            return out;
-        }
 
-        // One JNI read each, rather than one per field per component.
-        int[] st = new int[count * stats.cols()];
+        final int sc = stats.cols();
+        if (st.length < count * sc) st = new int[count * sc];
+        if (ce.length < count * 2) ce = new double[count * 2];
+        if (todo.length < count) {
+            todo = new int[count];
+            prob = new double[count];
+        }
         stats.get(0, 0, st);
-        double[] ce = new double[count * 2];
         centroids.get(0, 0, ce);
-        int sc = stats.cols();
 
+        int n = 0;
         for (int i = 1; i < count; i++) {   // label 0 is the background
-            int area = st[i * sc + Imgproc.CC_STAT_AREA];
-            if (area < MIN_AREA || area > MAX_AREA) {
-                continue;
-            }
-            int left = st[i * sc + Imgproc.CC_STAT_LEFT];
-            int top = st[i * sc + Imgproc.CC_STAT_TOP];
-            int width = st[i * sc + Imgproc.CC_STAT_WIDTH];
-            int height = st[i * sc + Imgproc.CC_STAT_HEIGHT];
-
-            double p = features.compute(yuv, labels, i, left, top, width, height, area, f)
-                    ? BlobSvm.probability(f) : 0.0;
-
-            out.add(new BallCandidate(frameIndex, timestampUs, ce[2 * i], ce[2 * i + 1], area,
-                    left, top, width, height, p));
+            int a = st[i * sc + Imgproc.CC_STAT_AREA];
+            if (a >= MIN_AREA && a <= MAX_AREA) todo[n++] = i;
         }
+
+        if (n > 0) {
+            final int w = yuv.cols(), h = yuv.rows();
+            if (yuvBytes.length != w * h * 3) yuvBytes = new byte[w * h * 3];
+            if (labelInts.length != w * h) labelInts = new int[w * h];
+            yuv.get(0, 0, yuvBytes);
+            labels.get(0, 0, labelInts);
+
+            final int shares = (pool == null || n < PARALLEL_MIN_BLOBS) ? 1 : workers + 1;
+            final int total = n;
+            pending.clear();
+            for (int k = 1; k < shares; k++) {
+                final int share = k;
+                pending.add(pool.submit(() -> score(share, shares, total, w, h, sc)));
+            }
+            score(0, shares, total, w, h, sc);
+            for (Future<?> fu : pending) {
+                try {
+                    fu.get();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("blob scoring interrupted", e);
+                } catch (ExecutionException e) {
+                    throw new IllegalStateException("blob scoring failed", e.getCause());
+                }
+            }
+
+            for (int j = 0; j < n; j++) {
+                int i = todo[j];
+                out.add(new BallCandidate(frameIndex, timestampUs, ce[2 * i], ce[2 * i + 1],
+                        st[i * sc + Imgproc.CC_STAT_AREA],
+                        st[i * sc + Imgproc.CC_STAT_LEFT], st[i * sc + Imgproc.CC_STAT_TOP],
+                        st[i * sc + Imgproc.CC_STAT_WIDTH], st[i * sc + Imgproc.CC_STAT_HEIGHT],
+                        prob[j]));
+            }
+        }
+
+        logTiming(System.nanoTime() - t0, n);
         return out;
     }
 
+    /** Scores blobs share, share + shares, ... of the todo list. Shares touch disjoint slots of prob. */
+    private void score(int share, int shares, int n, int w, int h, int sc) {
+        BlobFeatures bf = features[share];
+        double[] x = f[share];
+        for (int j = share; j < n; j += shares) {
+            int i = todo[j];
+            int b = i * sc;
+            prob[j] = bf.compute(yuvBytes, labelInts, w, h, i,
+                    st[b + Imgproc.CC_STAT_LEFT], st[b + Imgproc.CC_STAT_TOP],
+                    st[b + Imgproc.CC_STAT_WIDTH], st[b + Imgproc.CC_STAT_HEIGHT],
+                    st[b + Imgproc.CC_STAT_AREA], x)
+                    ? BlobSvm.probability(x) : 0.0;
+        }
+    }
+
+    private void logTiming(long dt, int blobs) {
+        timedNanos += dt;
+        timedBlobs += blobs;
+        worstNanos = Math.max(worstNanos, dt);
+        if (++timedFrames == LOG_EVERY) {
+            Log.d(TAG, String.format(Locale.US,
+                    "last %d frames: %.1f blobs/frame, %.2f ms/frame mean, %.2f ms worst (%d threads)",
+                    timedFrames, (double) timedBlobs / timedFrames,
+                    timedNanos / 1e6 / timedFrames, worstNanos / 1e6, workers + 1));
+            timedNanos = 0;
+            timedBlobs = 0;
+            timedFrames = 0;
+            worstNanos = 0;
+        }
+    }
+
     public void release() {
+        if (pool != null) {
+            pool.shutdownNow();
+        }
         labels.release();
         stats.release();
         centroids.release();
-        features.release();
     }
 }
