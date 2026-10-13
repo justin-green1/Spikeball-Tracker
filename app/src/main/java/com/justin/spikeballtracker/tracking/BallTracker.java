@@ -24,7 +24,7 @@ public class BallTracker {
 
     private static final int    MAX_TRACKS          = 400;
 
-    public static final int    DELAY               = 15;
+    public static final int     DELAY               = 15;
     private static final int    CAP                 = DELAY + 1;
 
     private final int[]         slotFrame           = new int[CAP];
