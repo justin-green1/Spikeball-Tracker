@@ -22,10 +22,11 @@ import java.util.concurrent.Future;
  * features cannot be computed (fewer than 3 in-box pixels, which the study
  * skipped) get P(ball) = 0.
  *
- * <p>The SVM was trained on 40-400 px blobs only. The floor here is
- * {@link #MIN_AREA}, so smaller blobs are scored outside the range the model
- * has seen. Raising it is also the simplest way to cut cost: on S3C01 there are
- * ~140 blobs a frame at 15 px, ~110 at 20, ~60 at 40.
+ * <p>The SVM was trained on 40-400 px blobs only, and {@link #MIN_AREA}
+ * matches that floor (raised from 15 on 13 Oct 2026). Below 40 px the blobs
+ * are mostly clutter: on frames 901-5400 of S1C01, S3C01 and s5c04 (box B),
+ * 15-39 px blobs were 45-61 % of all blobs, while the ball on tracked
+ * flights fell in that range in only 2-10 % of its sightings.
  *
  * <p>Cost: the frame and the label image are read out of OpenCV once per
  * frame, and everything per blob is plain Java ({@link BlobFeatures}, then
@@ -39,7 +40,7 @@ import java.util.concurrent.Future;
  */
 public final class SvmBlobDetector {
 
-    private static final int MIN_AREA = 15;
+    private static final int MIN_AREA = 40;
     private static final int MAX_AREA = 400;
 
     /** Extra threads for busy frames; the calling thread takes a share too. */
