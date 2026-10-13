@@ -41,9 +41,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String TAG = "MainActivity";
 
     static {
-        if (OpenCVLoader.initLocal()) {
-            Log.d(TAG, "OpenCV library correctly loaded");
-        } else {
+        if (!OpenCVLoader.initLocal()) {
             Log.e(TAG, "OpenCV library failed to load");
         }
     }
@@ -59,19 +57,15 @@ public class MainActivity extends AppCompatActivity {
 
     private final ActivityResultLauncher<String[]> videoPickerLauncher =
             registerForActivityResult(new ActivityResultContracts.OpenDocument(), uri -> {
-                if (uri == null) {
-                    Log.w(TAG, "no video selected");
-                    return;
+                if (uri != null) {
+                    videoPlayer.play(uri, this::showFrame);
                 }
-                videoPlayer.play(uri, this::showFrame);
             });
 
     private final ActivityResultLauncher<String> cameraPermissionLauncher =
             registerForActivityResult(new ActivityResultContracts.RequestPermission(), granted -> {
                 if (granted) {
                     cameraSource.start(this, this::showFrame);
-                } else {
-                    Log.w(TAG, "camera permission denied");
                 }
             });
 
@@ -116,13 +110,7 @@ public class MainActivity extends AppCompatActivity {
         stopButton.setOnClickListener(v -> stopAllSources());
 
         Button clearButton = findViewById(R.id.clear_background_button);
-        clearButton.setOnClickListener(v -> {
-            if (cameraSource.requestBackgroundReset()) {
-                Log.d(TAG, "background reset requested");
-            } else {
-                Log.w(TAG, "camera not running, nothing to reset");
-            }
-        });
+        clearButton.setOnClickListener(v -> cameraSource.requestBackgroundReset());
 
         saveRallyButton = findViewById(R.id.save_rally_button);
         saveRallyButton.setEnabled(rallySaver.hasRally());   // greyed out until the first rally

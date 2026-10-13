@@ -56,7 +56,7 @@ public final class Track {
 
         // ---  x = p + q * u : 2x2 least squares   ---
         double det2 = n * suu - su * su;
-        if(Math.abs(det2) < EPS){ //could be error here, do i need to define EPS
+        if(Math.abs(det2) < EPS){
             p = sx / n;
             q = 0;
         }else{
@@ -66,7 +66,7 @@ public final class Track {
 
         // --- y ---
         if ( n < 4){ // assume a straight line with no curve.
-            if(Math.abs(det2) < EPS){ //could be error here, do i need to define EPS
+            if(Math.abs(det2) < EPS){
                 a = sy / n;
                 b = 0;
             }else{

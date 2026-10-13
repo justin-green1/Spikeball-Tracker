@@ -4,70 +4,31 @@ import org.opencv.core.Core;
 import org.opencv.core.Mat;
 import org.opencv.core.Scalar;
 
+/**
+ * Masks the pixels inside the ball's colour box.
+ *
+ * <p>Matches on chroma alone; the luma bounds stay wide open so detection
+ * survives shade and direct sun.
+ */
 public class ColourDetector {
-    private static final String TAG = "ColourDetector";
-    private final Mat colourMask;
-    private final Scalar lowerBound;
-    private final Scalar upperBound;
-
-    //U 43–120, V 130–167 super wide
-    //U 43–87, V 143–167 tighter
-    //U 43–101, V 143–167 looser
-    private static final Scalar NARROW_LO = new Scalar(0, 43, 143);
-    private static final Scalar NARROW_HI = new Scalar(255, 87, 167);
-    private static final Scalar WIDE_LO = new Scalar(0, 43, 130);
-    private static final Scalar WIDE_HI = new Scalar(255, 120, 167);
 
     /**
-     * The wide box widened by 10 % of its span on each side, rounded outward:
-     * the box the blob SVM's training crops were cut with
+     * The colour box the blob SVM's training crops were cut with
      * (studies/classifier/extract_blob_candidates.py). The SVM decides what is
      * a ball inside it, so it is deliberately loose.
      */
-    public static final Scalar SVM_LO = new Scalar(0, 35, 126);
-    public static final Scalar SVM_HI = new Scalar(255, 128, 171);
+    public static final Scalar LO = new Scalar(0, 35, 126);
+    public static final Scalar HI = new Scalar(255, 128, 171);
 
+    private final Mat colourMask = new Mat();
 
-     /**
-     * Matches the ball on chroma alone; the luma bounds stay wide open so
-     * detection survives shade and direct sun.
-     *
-     * <p>FrameExtractor expands frames from limited range to full range, so
-     * these bounds were remapped through the same chroma transform,
-     * {@code out = (in - 128) * 255/224 + 128}, to keep matching the same
-     * physical colours:
-     *
-     * <pre>
-     *   U  49..92    ->  38..87
-     *   V  142..156  ->  144..160
-     * </pre>
-     *
-     * <p>The remap is exact: every value the old bounds accepted lands inside
-     * the new ones, and no value they rejected leaks in.
+    /**
+     * @param frame CV_8UC3 Y,U,V frame
+     * @return 255 inside the box, 0 outside; owned by this detector and
+     *         overwritten on the next call
      */
-    private ColourDetector(Scalar lowerBound, Scalar upperBound){
-        this.colourMask = new Mat();
-        this.lowerBound = lowerBound;
-        this.upperBound = upperBound;
-
-
-    }
-
-    public static ColourDetector narrow(){
-        return new ColourDetector(NARROW_LO, NARROW_HI);
-    }
-
-    public static ColourDetector wide(){
-        return new ColourDetector(WIDE_LO, WIDE_HI);
-    }
-
-    /** The widened box the blob SVM was trained behind; see {@link #SVM_LO}. */
-    public static ColourDetector svmBox(){
-        return new ColourDetector(SVM_LO, SVM_HI);
-    }
-
-    public Mat processFrame(Mat Frame) {
-        Core.inRange(Frame, lowerBound, upperBound, colourMask);
+    public Mat processFrame(Mat frame) {
+        Core.inRange(frame, LO, HI, colourMask);
         return colourMask;
     }
 

@@ -1,15 +1,12 @@
 package com.justin.spikeballtracker.video;
 
 import android.content.Context;
-import android.graphics.Rect;
 import android.media.Image;
 import android.media.MediaCodec;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.net.Uri;
-import android.os.Build;
 import android.util.Log;
-
 
 import org.opencv.core.Core;
 import org.opencv.core.CvType;
@@ -19,17 +16,12 @@ import org.opencv.imgproc.Imgproc;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
 
 public class FrameExtractor {
     private final Context context;
     private static final String TAG = "FrameExtractor";
     private static final long BUFFER_TIMEOUT_US = 10_000;
     private final YuvFrameBuilder yuvBuilder = new YuvFrameBuilder();
-
-    private volatile String mime = "unknown";
-    private volatile String colourRange = "undeclared";
-    private volatile String colourStandard = "unknown";
     public static final Size TARGET_SIZE = new Size(854, 480);
 
     /**
@@ -45,42 +37,6 @@ public class FrameExtractor {
 
     public FrameExtractor(Context context) {
         this.context = context.getApplicationContext();
-    }
-
-    /**
-     * An immutable snapshot of what the current stream declared about colour.
-     *
-     * <p>The fields it copies live on this long-lived extractor and are reset
-     * per stream; taking a snapshot means a caller cannot accidentally read a
-     * previous video's metadata, which is the failure mode that made an
-     * untagged file report as limited bt709.
-     */
-    public static final class ColourInfo {
-        public final String mime;
-        public final String range;
-        public final String standard;
-        public final boolean expandToFullRange;
-
-        ColourInfo(String mime, String range, String standard, boolean expandToFullRange) {
-            this.mime = mime;
-            this.range = range;
-            this.standard = standard;
-            this.expandToFullRange = expandToFullRange;
-        }
-
-        @Override
-        public String toString() {
-            return "mime=" + mime + " range=" + range + " standard=" + standard
-                    + " expandToFullRange=" + expandToFullRange;
-        }
-    }
-
-    /**
-     * What the current stream declared. Valid once decoding has begun; the
-     * fields are set by readColourInfo before the first frame is delivered.
-     */
-    public ColourInfo colourInfo() {
-        return new ColourInfo(mime, colourRange, colourStandard, expandToFullRange);
     }
 
     public interface FrameListener {
@@ -121,15 +77,7 @@ public class FrameExtractor {
 
             extractor.selectTrack(trackIndex);
             MediaFormat format = extractor.getTrackFormat(trackIndex);
-            Log.d(TAG, "video format: " + format);
-
-            readColourInfo(format);
-            Log.d(TAG, "colour: mime=" + mime
-                    + " range=" + colourRange
-                    + " standard=" + colourStandard
-                    + " -> " + (expandToFullRange
-                            ? "expanding to full range"
-                            : "already full range, passing through"));
+            expandToFullRange = !isFullRange(format);
 
             codec = createDecoder(format);
             decodeLoop(extractor, codec, listener);
@@ -143,52 +91,13 @@ public class FrameExtractor {
     }
 
     /**
-     * Records what the container claims about colour range and primaries.
-     *
-     * <p>Both keys are optional and frequently absent on consumer footage; an
-     * undeclared range conventionally means limited (16-235), but this method
-     * reports "undeclared" rather than assuming, so callers can decide.
+     * Whether the container declares full-range (0-255) samples. The key is
+     * optional and frequently absent on consumer footage; an undeclared range
+     * conventionally means limited (16-235).
      */
-    private void readColourInfo(MediaFormat format) {
-        // Reset first. These fields outlive a single stream, and the keys below
-        // are optional, so without this an untagged video silently inherits the
-        // colour metadata of whichever video was opened before it.
-        mime = "unknown";
-        colourRange = "undeclared";
-        colourStandard = "unknown";
-        expandToFullRange = true;
-
-        mime = format.getString(MediaFormat.KEY_MIME);
-
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
-            return;   // the colour keys did not exist before API 24
-        }
-
-        if (format.containsKey(MediaFormat.KEY_COLOR_RANGE)) {
-            int range = format.getInteger(MediaFormat.KEY_COLOR_RANGE);
-            if (range == MediaFormat.COLOR_RANGE_FULL) {
-                colourRange = "full";
-                expandToFullRange = false;   // already 0-255, expanding would clip
-            } else if (range == MediaFormat.COLOR_RANGE_LIMITED) {
-                colourRange = "limited";
-            } else {
-                colourRange = "unknown(" + range + ")";
-            }
-        }
-
-        if (format.containsKey(MediaFormat.KEY_COLOR_STANDARD)) {
-            int std = format.getInteger(MediaFormat.KEY_COLOR_STANDARD);
-            if (std == MediaFormat.COLOR_STANDARD_BT709) {
-                colourStandard = "bt709";
-            } else if (std == MediaFormat.COLOR_STANDARD_BT601_PAL
-                    || std == MediaFormat.COLOR_STANDARD_BT601_NTSC) {
-                colourStandard = "bt601";
-            } else if (std == MediaFormat.COLOR_STANDARD_BT2020) {
-                colourStandard = "bt2020";
-            } else {
-                colourStandard = "unknown(" + std + ")";
-            }
-        }
+    private static boolean isFullRange(MediaFormat format) {
+        return format.containsKey(MediaFormat.KEY_COLOR_RANGE)
+                && format.getInteger(MediaFormat.KEY_COLOR_RANGE) == MediaFormat.COLOR_RANGE_FULL;
     }
 
     /**

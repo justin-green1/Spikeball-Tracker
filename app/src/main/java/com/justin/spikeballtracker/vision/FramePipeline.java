@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <p>The display is the current frame with only the net box drawn on it. The
  * ball tracker answers {@link BallTracker#DELAY} frames late; its answers feed
- * the rally detector and the logs, never the picture.
+ * the rally detector, never the picture.
  *
  * <p>Input is always a CV_8UC3 Y,U,V Mat at the working resolution
  * (854x480, landscape). Delivering that is the caller's job.
@@ -38,18 +38,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class FramePipeline {
 
     private static final String TAG = "FramePipeline";
-
-    /**
-     * Which detector feeds the tracker.
-     *
-     * <p>true: one widened colour box ANDed with the motion mask (shadows kept),
-     * every 15-400 px blob scored by {@link BlobSvm}; narrow candidates are those
-     * with P(ball) >= {@link BlobSvm#NARROW_THRESHOLD}, wide those with
-     * P(ball) >= {@link BlobSvm#WIDE_THRESHOLD}, so narrow is a subset of wide.
-     *
-     * <p>false: the narrow and wide colour boxes, as before.
-     */
-    public static final boolean USE_BLOB_SVM = true;
 
     /** The display Mat is RGB, so this is (R, G, B). */
     private static final Scalar NET_COLOUR = new Scalar(0, 255, 255);
@@ -59,79 +47,22 @@ public final class FramePipeline {
     private static final long NET_WARMUP_US           = 10_000_000L;
     private static final long NET_ATTEMPT_INTERVAL_US =  5_000_000L;
 
-    // ---------------------------------------------------------------- result
-
-    /** Everything the pipeline decided about one frame. */
-    public static final class Result {
-        /** 0-based index of the frame this result describes. */
-        public final int frameIndex;
-
-        /**
-         * Blobs that passed the narrow colour box and the motion mask, or with
-         * {@link #USE_BLOB_SVM}, moving blobs the SVM scored at or above its
-         * narrow threshold.
-         */
-        public final List<BallCandidate> narrowCandidates;
-
-        /**
-         * Blobs that passed the wide colour box and the motion mask, or with
-         * {@link #USE_BLOB_SVM}, moving blobs the SVM scored at or above its
-         * wide threshold.
-         */
-        public final List<BallCandidate> wideCandidates;
-
-        /**
-         * The tracker's answer for frame {@code frameIndex - BallTracker.DELAY},
-         * or null during the first DELAY frames of a run.
-         */
-        public final BallTracker.Output ball;
-
-        /** Net box in frame coordinates, or null until the first lock. */
-        public final Rect netBox;
-
-        /**
-         * Rallies confirmed on this frame, usually empty. A rally is confirmed
-         * a few seconds after it ends, so its times are well in the past.
-         */
-        public final List<RallyDetector.Rally> newRallies;
-
-        Result(int frameIndex,
-               List<BallCandidate> narrowCandidates,
-               List<BallCandidate> wideCandidates,
-               BallTracker.Output ball,
-               Rect netBox,
-               List<RallyDetector.Rally> newRallies) {
-            this.frameIndex = frameIndex;
-            this.narrowCandidates = narrowCandidates;
-            this.wideCandidates = wideCandidates;
-            this.ball = ball;
-            this.netBox = netBox;
-            this.newRallies = newRallies;
-        }
-    }
-
     // ---------------------------------------------------------------- detectors
 
-    private final MotionDetector motionDetector       = new MotionDetector();
-    private final ColourDetector narrowColourDetector = ColourDetector.narrow();
-    private final ColourDetector wideColourDetector   = ColourDetector.wide();
-    private final BlobDetector   narrowBlobDetector   = BlobDetector.narrow();
-    private final BlobDetector   wideBlobDetector     = BlobDetector.wide();
-    private final ColourDetector svmColourDetector    = ColourDetector.svmBox();
-    private final SvmBlobDetector svmBlobDetector     =
-            new SvmBlobDetector(ColourDetector.SVM_LO, ColourDetector.SVM_HI);
-    private final NetDetector    netDetector          = new NetDetector();
-    private final BallTracker    tracker              = new BallTracker();
+    private final MotionDetector  motionDetector  = new MotionDetector();
+    private final ColourDetector  colourDetector  = new ColourDetector();
+    private final SvmBlobDetector svmBlobDetector =
+            new SvmBlobDetector(ColourDetector.LO, ColourDetector.HI);
+    private final NetDetector     netDetector     = new NetDetector();
+    private final BallTracker     tracker         = new BallTracker();
 
     /** Replaced on a background reset, so not final. */
     private RallyDetector rallyDetector = new RallyDetector();
 
     // ---------------------------------------------------------------- reusable Mats
 
-    private final Mat narrowBallMask = new Mat();
-    private final Mat wideBallMask   = new Mat();
-    private final Mat svmBallMask    = new Mat();
-    private final Mat background     = new Mat();
+    private final Mat ballMask   = new Mat();
+    private final Mat background = new Mat();
 
     // ---------------------------------------------------------------- run state
 
@@ -147,7 +78,7 @@ public final class FramePipeline {
     /** How many of the current rally detector's rallies have been handed out. */
     private int ralliesReported = 0;
 
-    /** Confirmed since the last Result; filled by {@link #collectRallies()}. */
+    /** Confirmed since the last {@link #process}; filled by {@link #collectRallies()}. */
     private final List<RallyDetector.Rally> confirmedRallies = new ArrayList<>();
 
     /**
@@ -168,9 +99,10 @@ public final class FramePipeline {
      * @param yuv         CV_8UC3 Y,U,V frame at the working resolution
      * @param timestampUs microseconds since this run's first frame
      * @param displayOut  written with this frame in RGB, plus the net box
-     * @return what the pipeline decided about this frame
+     * @return rallies confirmed on this frame, usually none. A rally is
+     *         confirmed a few seconds after it ends, so its times are well in the past.
      */
-    public Result process(Mat yuv, long timestampUs, Mat displayOut) {
+    public List<RallyDetector.Rally> process(Mat yuv, long timestampUs, Mat displayOut) {
         int index = frameIndex++;
         if (index == 0) {
             warmStartUs = timestampUs;
@@ -179,45 +111,34 @@ public final class FramePipeline {
             applyReset(timestampUs);
         }
 
-        // Detection: one motion mask, then either the blob SVM or the two colour boxes.
-        Mat motionMask = motionDetector.processFrame(yuv);
-        List<BallCandidate> narrowCandidates;
-        List<BallCandidate> wideCandidates;
-        if (USE_BLOB_SVM) {
-            Core.bitwise_and(svmColourDetector.processFrame(yuv),
-                    motionDetector.maskWithShadows(), svmBallMask);
-            List<BallCandidate> scored =
-                    svmBlobDetector.findCandidates(svmBallMask, yuv, index, timestampUs);
-            narrowCandidates = new ArrayList<>();
-            wideCandidates = new ArrayList<>();
-            for (BallCandidate c : scored) {
-                if (c.pBall >= BlobSvm.NARROW_THRESHOLD) narrowCandidates.add(c);
-                if (c.pBall >= BlobSvm.WIDE_THRESHOLD) wideCandidates.add(c);
-            }
-        } else {
-            Core.bitwise_and(narrowColourDetector.processFrame(yuv), motionMask, narrowBallMask);
-            Core.bitwise_and(wideColourDetector.processFrame(yuv), motionMask, wideBallMask);
-            narrowCandidates = narrowBlobDetector.findCandidates(narrowBallMask, index, timestampUs);
-            wideCandidates = wideBlobDetector.findCandidates(wideBallMask, index, timestampUs);
+        // Detection: the colour box ANDed with the motion mask (shadows kept),
+        // every blob scored by the SVM. Narrow candidates are those with
+        // P(ball) >= NARROW_THRESHOLD, wide those with P(ball) >= WIDE_THRESHOLD,
+        // so narrow is a subset of wide.
+        Core.bitwise_and(colourDetector.processFrame(yuv),
+                motionDetector.processFrame(yuv), ballMask);
+        List<BallCandidate> narrowCandidates = new ArrayList<>();
+        List<BallCandidate> wideCandidates = new ArrayList<>();
+        for (BallCandidate c : svmBlobDetector.findCandidates(ballMask, yuv)) {
+            if (c.pBall >= BlobSvm.NARROW_THRESHOLD) narrowCandidates.add(c);
+            if (c.pBall >= BlobSvm.WIDE_THRESHOLD) wideCandidates.add(c);
         }
 
         // Tracking.
         tracker.process(index, timestampUs, narrowCandidates, wideCandidates);
-        BallTracker.Output ball = tracker.latest();
 
         // Net.
         updateNet(timestampUs);
 
         // Rallies: the delayed ball answer, judged against the net as it stands now.
-        rallyDetector.process(ball, cachedNetZone);
+        rallyDetector.process(tracker.latest(), cachedNetZone);
         collectRallies();
 
         // Display: the live frame and the net, nothing else.
         Imgproc.cvtColor(yuv, displayOut, Imgproc.COLOR_YUV2RGB);
         drawNet(displayOut);
 
-        return new Result(index, narrowCandidates, wideCandidates, ball, cachedNetBox,
-                drainRallies());
+        return drainRallies();
     }
 
     /**
@@ -241,15 +162,9 @@ public final class FramePipeline {
     /** Frees every native Mat this pipeline owns. */
     public void release() {
         motionDetector.release();
-        narrowColourDetector.release();
-        wideColourDetector.release();
-        narrowBlobDetector.release();
-        wideBlobDetector.release();
-        svmColourDetector.release();
+        colourDetector.release();
         svmBlobDetector.release();
-        narrowBallMask.release();
-        wideBallMask.release();
-        svmBallMask.release();
+        ballMask.release();
         background.release();
     }
 
@@ -278,15 +193,10 @@ public final class FramePipeline {
             // same interval as a success.
             lastNetAttemptUs = timestampUs;
 
-            NetDetector.NetResult result = netDetector.detect(background);
-            if (result != null && result.box != null) {
-                cachedNetBox = result.box;
-                cachedNetZone = NetZone.around(cachedNetBox.x, cachedNetBox.y,
-                        cachedNetBox.width, cachedNetBox.height);
-                Log.d(TAG, "net locked: " + cachedNetBox);
-            } else {
-                Log.d(TAG, "no net in this plate; next attempt in "
-                        + (NET_ATTEMPT_INTERVAL_US / 1_000_000L) + "s");
+            Rect box = netDetector.detect(background);
+            if (box != null) {
+                cachedNetBox = box;
+                cachedNetZone = NetZone.around(box.x, box.y, box.width, box.height);
             }
         } catch (Exception e) {
             Log.e(TAG, "net update failed", e);
@@ -325,7 +235,7 @@ public final class FramePipeline {
     /** Clears every model that describes the old framing; called on the pipeline thread. */
     private void applyReset(long timestampUs) {
         // Close the old framing's rallies first; anything confirmed goes out
-        // with this frame's Result.
+        // with this frame's result.
         rallyDetector.finish();
         collectRallies();
         rallyDetector = new RallyDetector();
@@ -337,6 +247,5 @@ public final class FramePipeline {
         cachedNetZone = null;
         warmStartUs = timestampUs;                                  // warm-up counts from here
         lastNetAttemptUs = timestampUs - NET_ATTEMPT_INTERVAL_US;   // due the moment it is warm
-        Log.d(TAG, "background reset; net, tracker and rallies cleared, warm-up restarts");
     }
 }

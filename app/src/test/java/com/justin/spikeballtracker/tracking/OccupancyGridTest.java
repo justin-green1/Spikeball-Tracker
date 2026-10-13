@@ -12,7 +12,7 @@ public class OccupancyGridTest {
 
     /** Only x and y matter to the grid; everything else is filler. */
     private static List<BallCandidate> at(double x, double y) {
-        return Collections.singletonList(new BallCandidate(0, 0L, x, y, 50, 0, 0, 0, 0));
+        return Collections.singletonList(new BallCandidate(x, y, 1.0));
     }
 
     private static final List<BallCandidate> NONE = Collections.emptyList();

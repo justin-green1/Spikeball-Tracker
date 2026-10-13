@@ -1,7 +1,5 @@
 package com.justin.spikeballtracker.vision;
 
-import android.util.Log;
-
 import org.opencv.core.Mat;
 import org.opencv.core.Size;
 import org.opencv.imgproc.Imgproc;
@@ -10,16 +8,14 @@ import org.opencv.video.Video;
 
 public class MotionDetector {
 
-    private static final String TAG = "MotionDetector";
     private BackgroundSubtractorKNN subtractor;
     private static final int HISTORY = 3600;
     private static final double DIST_2_THRESHOLD = 100;
     private static final boolean DETECT_SHADOWS = true;
     private static final Size BLUR_KERNEL = new Size(9, 9);
     private final Mat blurredFrame;
-    private final Mat foregroundMask;
 
-    /** This frame's mask before thresholding: 255 motion, 127 shadow, 0 still. */
+    /** This frame's mask: 255 motion, 127 shadow, 0 still. */
     private final Mat maskWithShadows;
 
     /**
@@ -32,7 +28,6 @@ public class MotionDetector {
      */
     public MotionDetector(){
         this.subtractor = newSubtractor();
-        this.foregroundMask = new Mat();
         this.maskWithShadows = new Mat();
         this.blurredFrame = new Mat();
     }
@@ -45,52 +40,18 @@ public class MotionDetector {
      * Blurs the frame with the 9x9 pre-blur, then feeds it to the KNN
      * background subtractor, updating the model.
      *
+     * <p>The mask keeps shadow pixels (127) rather than thresholding them
+     * away: the blob SVM's training blobs were cut from this unthresholded
+     * mask, so shadow pixels count as foreground here too.
+     *
      * @param frame CV_8UC3 Y,U,V frame at the working resolution
-     * @return binary foreground mask (0 or 255), owned by this detector and
-     *         overwritten on the next call
+     * @return foreground mask (255 motion, 127 shadow, 0 still), owned by this
+     *         detector and overwritten on the next call
      */
     public Mat processFrame(Mat frame) {
         Imgproc.GaussianBlur(frame, blurredFrame, BLUR_KERNEL, 0);
-        subtractor.apply(blurredFrame, foregroundMask);
-        foregroundMask.copyTo(maskWithShadows);
-
-        // Maps <= 127 to 0, and > 127 (i.e., 255) to 255
-        Imgproc.threshold(foregroundMask, foregroundMask, 127, 255, Imgproc.THRESH_BINARY);
-        return foregroundMask;
-    }
-
-    /**
-     * The last frame's mask with shadow pixels kept (127), as
-     * {@link #processFrame} computed it before thresholding.
-     *
-     * <p>The blob SVM's training blobs were cut from this unthresholded mask
-     * (the offline replica ANDs it with the colour box as-is, so shadow pixels
-     * count as foreground), so the SVM path uses it to see blobs the same way.
-     * Owned by this detector and overwritten on the next call.
-     */
-    public Mat maskWithShadows() {
+        subtractor.apply(blurredFrame, maskWithShadows);
         return maskWithShadows;
-    }
-
-    /**
-     * The KNN settings in force. Exposed so a run's provenance can be recorded
-     * alongside exported frames, and so offline work can rebuild the same model.
-     */
-    public static int history() {
-        return HISTORY;
-    }
-
-    public static double dist2Threshold() {
-        return DIST_2_THRESHOLD;
-    }
-
-    public static boolean detectShadows() {
-        return DETECT_SHADOWS;
-    }
-
-    /** Width of the Gaussian kernel applied before every subtractor.apply. */
-    public static int preBlurKernel() {
-        return (int) BLUR_KERNEL.width;
     }
 
     public void getBackgroundImage(Mat background) {
@@ -116,7 +77,6 @@ public class MotionDetector {
      * releases all object fields
      */
     public void release() {
-        this.foregroundMask.release();
         this.maskWithShadows.release();
         this.subtractor.clear();
         this.blurredFrame.release();

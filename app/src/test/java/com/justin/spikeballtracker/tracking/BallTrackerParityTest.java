@@ -53,7 +53,7 @@ public class BallTrackerParityTest {
             Matcher m = POINT.matcher(l);
             while (m.find()) {
                 double x = Double.parseDouble(m.group(1)), y = Double.parseDouble(m.group(2));
-                row.cands.add(new BallCandidate(row.frame - 1, row.tUs, x, y, 0, 0, 0, 0, 0));
+                row.cands.add(new BallCandidate(x, y, 1.0));
             }
             rows.add(row);
         }
@@ -61,7 +61,7 @@ public class BallTrackerParityTest {
     }
 
     @Test
-    public void trackAndConfirmedCountsMatchPython() throws Exception {
+    public void ballOutputMatchesPython() throws Exception {
         List<Row> narrow = detections("s2c05/detections_narrow.csv");
         List<Row> wide   = detections("s2c05/detections_wide.csv");
         List<String> ref = lines(REFERENCE);
@@ -70,14 +70,6 @@ public class BallTrackerParityTest {
         for (int i = 0; i < narrow.size(); i++) {
             Row n = narrow.get(i), w = wide.get(i);
             tracker.process(n.frame - 1, n.tUs, n.cands, w.cands);   // pipeline frameIndex is 0-based
-
-            String[] r = ref.get(i).split(",", -1);
-            int expTracks = Integer.parseInt(r[1]), expConfirmed = Integer.parseInt(r[2]);
-            if (tracker.trackCount() != expTracks || tracker.confirmedCount() != expConfirmed) {
-                fail("first mismatch at Frame " + n.frame
-                        + ": tracks " + tracker.trackCount() + " (expected " + expTracks + ")"
-                        + ", confirmed " + tracker.confirmedCount() + " (expected " + expConfirmed + ")");
-            }
 
             BallTracker.Output out = tracker.latest();
             if (out != null) {

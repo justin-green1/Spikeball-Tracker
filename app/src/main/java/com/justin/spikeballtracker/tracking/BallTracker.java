@@ -147,20 +147,12 @@ public class BallTracker {
     }
 
     private static boolean plausibleThird(Track t, BallCandidate c, long tUs){
-        //todo choose which option is best here
-
         Track.Point p1 = t.points().get(0), p2 = t.points().get(1);
         double dt1 = (p2.tUs - p1.tUs) / 1e6,   dt2 = (tUs - p2.tUs) / 1e6;
         double vx1 = (p2.x - p1.x) / dt1,       vx2 = (c.x - p2.x) / dt2;
         double vy1 = (p2.y - p1.y) / dt1,       vy2 = (c.y - p2.y) / dt2;
         double dvx = vx1 - vx2,                 dvy = vy1 - vy2;
         return Math.sqrt(dvx * dvx + dvy * dvy) <= SEED_DV_PX_S;
-         /*
-        Track.Point p1 = t.points().get(0), p2 = t.points().get(1);
-        double ddx = (c.x - p2.x) - (p2.x - p1.x);
-        double ddy = (c.y - p2.y) - (p2.y - p1.y);
-        return Math.sqrt(ddx * ddx + ddy * ddy) <= 25.0;
-        */
     }
 
     private void claim(Track t, int frameIndex){
@@ -217,16 +209,6 @@ public class BallTracker {
         int s = f % CAP;
         boolean has = slotFrame[s] == f && slotHas[s];
         latest = new Output(f, slotUs[s], has, slotX[s], slotY[s]);
-    }
-
-    public int trackCount(){
-        return tracks.size();
-    }
-
-    public int confirmedCount(){
-        int n = 0;
-        for (Track t : tracks) if (t.confirmed) n++;
-        return n;
     }
 
     public Output latest() {

@@ -36,7 +36,6 @@ public class RallyDetector {
     //R1
     private Track flight = null;
     private NetZone zone = null;
-    private final List<NetLink> flights = new ArrayList<>();
 
     //R2
     private final List<Frame> frames = new ArrayList<>();
@@ -48,17 +47,14 @@ public class RallyDetector {
     private int pendingStart = -1, pendingEnd;
     private final List<Rally> rallies = new ArrayList<>();
 
-    public static final class NetLink{
-        public final long startUs, endUs;
-        public final int points;
-        public final boolean toNet,fromNet;
-        public final long contactToUs, contactFromUs;
+    private static final class NetLink{
+        final long startUs, endUs;
+        final boolean toNet,fromNet;
+        final long contactToUs, contactFromUs;
 
-
-        private NetLink(long startUs, long endUs, int points, boolean toNet, long contactToUs,boolean fromNet, long contactFromUs) {
+        private NetLink(long startUs, long endUs, boolean toNet, long contactToUs,boolean fromNet, long contactFromUs) {
             this.startUs = startUs;
             this.endUs = endUs;
-            this.points = points;
             this.toNet = toNet;
             this.fromNet = fromNet;
             this.contactToUs = contactToUs;
@@ -67,13 +63,11 @@ public class RallyDetector {
     }
 
     private static final class Frame{
-        final int frameIndex;
         final long tUs;
         final boolean ball;
         boolean cover;
 
-        private Frame(int frameIndex, long tUs, boolean ball) {
-            this.frameIndex = frameIndex;
+        private Frame(long tUs, boolean ball) {
             this.tUs = tUs;
             this.ball = ball;
         }
@@ -92,7 +86,7 @@ public class RallyDetector {
         zone = currentZone;
         if(o == null) return;
 
-        Frame fr = new Frame(o.frameIndex, o.tUs, o.hasBall);
+        Frame fr = new Frame(o.tUs, o.hasBall);
         fr.cover = o.tUs <= coverUntilUs;
         frames.add(fr);
 
@@ -151,7 +145,7 @@ public class RallyDetector {
                 }
             }
         }
-        return new NetLink(first.tUs, last.tUs, pts.size(), toNet, contactTo, fromNet, contactFrom);
+        return new NetLink(first.tUs, last.tUs, toNet, contactTo, fromNet, contactFrom);
     }
 
     /**
@@ -179,13 +173,8 @@ public class RallyDetector {
         return NO_CONTACT;
     }
 
-    public List<NetLink> flights(){
-        return Collections.unmodifiableList(flights);
-    }
-
     private void closeFlight(){
         NetLink link = link(flight, zone);
-        flights.add(link);
         flight = null;
 
         if(link.toNet || link.fromNet){
@@ -292,6 +281,4 @@ public class RallyDetector {
     }
 
     public List<Rally> rallies(){ return Collections.unmodifiableList(rallies);}
-
-    public boolean isRallyNow(){return on;}
 }

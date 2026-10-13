@@ -1,6 +1,5 @@
 package com.justin.spikeballtracker.record;
 
-import android.content.Context;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
@@ -89,7 +88,7 @@ public final class ReplayBuffer {
     private Session current = null;                        // encoder thread only
     private final List<Session> live = new ArrayList<>();  // encoder thread only
 
-    public ReplayBuffer(Context context) {
+    public ReplayBuffer() {
         this.encoderThread = new HandlerThread("ReplayEncoder");
         this.encoderThread.start();
         this.encoderHandler = new Handler(encoderThread.getLooper());
@@ -129,7 +128,6 @@ public final class ReplayBuffer {
             }
 
             long skewUs = r.newestPtsUs() - nowUs;
-            Log.d(TAG, "recording clock - analysis clock = " + skewUs / 1000 + " ms");
             if (Math.abs(skewUs) > CLOCK_MISMATCH_US) {
                 Log.w(TAG, "recording and analysis timestamps are " + skewUs / 1000
                         + " ms apart, more than a clock's worth of latency; "
@@ -213,14 +211,11 @@ public final class ReplayBuffer {
         // The result arrives once the camera has stopped writing to the surface,
         // which is the only safe moment to tear the encoder down.
         request.provideSurface(session.surface, encoderExecutor, result -> {
-            Log.d(TAG, "preview surface finished, code " + result.getResultCode());
             session.end();
             if (current == session) {
                 current = null;
             }
         });
-
-        Log.d(TAG, "encoder session started at " + res);
     }
 
     private EncodedRing ensureRing() {
@@ -232,8 +227,6 @@ public final class ReplayBuffer {
         int slots = (int) Math.ceil(retainS) * MAX_FPS_FOR_SLOTS;
         try {
             ring = new EncodedRing(capacity, slots, RETAIN_US);
-            Log.i(TAG, "ring allocated: " + (capacity / (1024 * 1024)) + " MB, "
-                    + slots + " packet slots");
         } catch (OutOfMemoryError e) {
             Log.e(TAG, "not enough heap for a " + (capacity / (1024 * 1024))
                     + " MB replay ring; replay disabled");
@@ -289,7 +282,6 @@ public final class ReplayBuffer {
                 synchronized (r) {
                     outputFormat = format;
                 }
-                Log.d(TAG, "encoder output format: " + format);
             }
         }
 

@@ -66,7 +66,6 @@ public final class RallySaver {
             String name = "rally_" + stamp + ".mp4";
             try {
                 long durationUs = write(footage, name);
-                Log.i(TAG, "saved " + name + " (" + durationUs / 1000 + " ms)");
                 callback.onSaved(name, durationUs / 1_000_000.0);
             } catch (Exception e) {
                 Log.e(TAG, "rally save failed", e);

@@ -19,8 +19,8 @@ import java.nio.ByteBuffer;
  * since been evicted, rather than silently reading overwritten bytes.
  *
  * <p>Deliberately free of Android types so it can be unit-tested on a plain JVM.
- * Every public method is synchronized; the writer (encoder thread) and a reader
- * (save thread) only ever hold the lock for one packet's worth of copying.
+ * Every public method is synchronized; the writer (encoder thread) and the
+ * reader (camera analyser thread, copying out one rally) share the lock.
  */
 public final class EncodedRing {
 
@@ -116,46 +116,6 @@ public final class EncodedRing {
             this.firstPtsUs = firstPtsUs;
             this.lastPtsUs = lastPtsUs;
         }
-
-        public long durationUs() {
-            return lastPtsUs - firstPtsUs;
-        }
-    }
-
-    /**
-     * Chooses the packets covering the last {@code durationUs}, starting on a
-     * keyframe so the clip decodes from its first frame.
-     *
-     * <p>Starts at the latest keyframe at or before {@code newest - durationUs},
-     * so the clip is at least as long as asked whenever enough is buffered. With
-     * less buffered than asked, it starts at the oldest keyframe held.
-     *
-     * @return null when there is nothing decodable in the ring
-     */
-    public synchronized Plan plan(long durationUs) {
-        if (count() == 0) {
-            return null;
-        }
-        long newestPts = ptsUs[slot(tailSeq - 1)];
-        long bound = newestPts - durationUs;
-
-        long start = -1;
-        for (long seq = headSeq; seq < tailSeq; seq++) {
-            int s = slot(seq);
-            if (!keyFrame[s]) {
-                continue;
-            }
-            if (ptsUs[s] <= bound || start < 0) {
-                start = seq;          // latest keyframe not after the bound, or the first one
-            }
-            if (ptsUs[s] > bound) {
-                break;
-            }
-        }
-        if (start < 0) {
-            return null;
-        }
-        return new Plan(start, tailSeq, ptsUs[slot(start)], newestPts);
     }
 
     /**
@@ -263,67 +223,8 @@ public final class EncodedRing {
         return ptsUs[slot(tailSeq - 1)];
     }
 
-    /** Metadata of one copied packet. */
-    public static final class Packet {
-        public int size;
-        public long ptsUs;
-        public boolean keyFrame;
-    }
-
-    /**
-     * Copies one packet into {@code dst} (cleared first, left flipped for reading).
-     *
-     * @return false if the packet has been evicted, or was never written
-     */
-    public synchronized boolean copy(long seq, ByteBuffer dst, Packet out) {
-        if (seq < headSeq || seq >= tailSeq) {
-            return false;
-        }
-        int s = slot(seq);
-        int n = size[s];
-        int pos = offset[s];
-
-        dst.clear();
-        int first = Math.min(n, data.length - pos);
-        dst.put(data, pos, first);
-        if (first < n) {
-            dst.put(data, 0, n - first);
-        }
-        dst.flip();
-
-        out.size = n;
-        out.ptsUs = ptsUs[s];
-        out.keyFrame = keyFrame[s];
-        return true;
-    }
-
-    /** Largest single packet held; a save sizes its scratch buffer from this. */
-    public synchronized int maxPacketSize() {
-        int max = 0;
-        for (long seq = headSeq; seq < tailSeq; seq++) {
-            max = Math.max(max, size[slot(seq)]);
-        }
-        return max;
-    }
-
-    /** Span between the oldest and newest packet held, in microseconds. */
-    public synchronized long bufferedUs() {
-        if (count() == 0) {
-            return 0;
-        }
-        return ptsUs[slot(tailSeq - 1)] - ptsUs[slot(headSeq)];
-    }
-
     public synchronized int count() {
         return (int) (tailSeq - headSeq);
-    }
-
-    public synchronized int usedBytes() {
-        return usedBytes;
-    }
-
-    public int capacityBytes() {
-        return data.length;
     }
 
     private void evictOldest() {

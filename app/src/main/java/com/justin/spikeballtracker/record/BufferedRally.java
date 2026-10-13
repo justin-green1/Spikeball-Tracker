@@ -27,16 +27,6 @@ public final class BufferedRally implements RallyFootage {
         this.rotationDegrees = rotationDegrees;
     }
 
-    /** Length held, first to last frame. */
-    public long durationUs() {
-        return packets.durationUs();
-    }
-
-    /** Bytes held, for the log. */
-    public int sizeBytes() {
-        return packets.data.length;
-    }
-
     @Override
     public long writeTo(MediaMuxer muxer) {
         muxer.setOrientationHint(rotationDegrees);

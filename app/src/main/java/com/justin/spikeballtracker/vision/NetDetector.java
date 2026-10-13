@@ -30,7 +30,7 @@ public class NetDetector {
     // ---------------------------------------------------------------------
     // candidate parameters.
 
-    private static final double MIN_Y_FRACTION  = 0.69;     // was 0.67
+    private static final double MIN_Y_FRACTION  = 0.69;
     private static final int    MIN_BOX_WIDTH   = 75;
     private static final int    MAX_BOX_WIDTH   = 220;
     private static final double lowerThreshold  = 57.1;     // = upper / 2.09
@@ -39,7 +39,7 @@ public class NetDetector {
     private static final double sigmaColour     = 146.6;
     private static final int    d               = 5;
     private static final int    MORPH_HEIGHT    = 9;
-    private static final int    MORPH_WIDTH     = 25;       // was 21
+    private static final int    MORPH_WIDTH     = 25;
     private static final double MAX_CX_OFFSET   = 0.14;
     private static final double MIN_CY_FRACTION = 0.50;
     private static final double MIN_DARKNESS    = -9.0;
@@ -59,21 +59,13 @@ public class NetDetector {
     private double[] sum;
     private int integralWidth;
 
-    public static class NetResult{
-        public final Rect box;
-
-        NetResult(Rect box){
-            this.box = box;
-        }
-    }
-
     /**
      * @param plate CV_8UC3 Y,U,V background plate from the KNN model, at the
      *              working resolution (854x480)
      * @return the net box in plate coordinates, or null if no candidate scores
      *         high enough or the plate is not {@value #WORK_HEIGHT} rows high
      */
-    public NetResult detect(Mat plate) {
+    public Rect detect(Mat plate) {
         if (plate == null || plate.empty()) return null;
 
         // Guards the "already at working resolution" contract. A source that
@@ -94,9 +86,7 @@ public class NetDetector {
             extractEdges(grey, edges);
 
             List<Rect> candidates = findCandidates(edges, grey, grey.cols(), grey.rows());
-            Rect best = pickBest(candidates, grey.cols(), grey.rows());
-
-            return best == null ? null : new NetResult(best);
+            return pickBest(candidates, grey.cols(), grey.rows());
 
         } finally {
             grey.release();
@@ -174,8 +164,6 @@ public class NetDetector {
                 candidates.add(box);
             }
 
-            //candidates = suppressContained(candidates);
-            Log.d(TAG, "Raw contours: " + contours.size() + "| Candidates Retained: " + candidates.size());
             return candidates;
         }
         finally{

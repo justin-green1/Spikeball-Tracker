@@ -1,7 +1,5 @@
 package com.justin.spikeballtracker.vision;
 
-import android.util.Log;
-
 import com.justin.spikeballtracker.tracking.BallCandidate;
 
 import org.opencv.core.Mat;
@@ -10,7 +8,6 @@ import org.opencv.imgproc.Imgproc;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -34,37 +31,29 @@ import java.util.concurrent.Future;
  * frame, and everything per blob is plain Java ({@link BlobFeatures}, then
  * {@link BlobSvm}). Busy frames are split across worker threads plus the
  * calling one; results are the same as single-threaded and in the same order.
- * The default is {@link #DEFAULT_WORKERS} workers (up to 3, leaving two cores
- * for the decoder and UI). Every {@link #LOG_EVERY} frames the mean blob count
- * and time per frame are logged under this class's tag.
+ * It uses {@link #WORKERS} workers (up to 3, leaving two cores for the
+ * decoder and UI).
  *
  * <p>Owns reusable buffers and a thread pool: one instance belongs to one
  * pipeline thread, and {@link #release()} stops the pool.
  */
 public final class SvmBlobDetector {
 
-    private static final String TAG = "SvmBlobDetector";
+    private static final int MIN_AREA = 15;
+    private static final int MAX_AREA = 400;
 
-    public static final int MIN_AREA = 15;
-    public static final int MAX_AREA = 400;
-
-    /** Default extra threads for busy frames; the calling thread takes a share too. */
-    public static final int DEFAULT_WORKERS =
+    /** Extra threads for busy frames; the calling thread takes a share too. */
+    private static final int WORKERS =
             Math.max(0, Math.min(3, Runtime.getRuntime().availableProcessors() - 2));
 
     /** Below this many blobs a frame is scored on the calling thread alone. */
     private static final int PARALLEL_MIN_BLOBS = 24;
 
-    /** Frames between timing log lines. */
-    private static final int LOG_EVERY = 150;
-
     private final Mat labels = new Mat();
     private final Mat stats = new Mat();
     private final Mat centroids = new Mat();
 
-    private final int workers;
-
-    /** One per share: [0] is the calling thread's, [1..workers] the workers'. */
+    /** One per share: [0] is the calling thread's, [1..WORKERS] the workers'. */
     private final BlobFeatures[] features;
     private final double[][] f;
     private final ExecutorService pool;
@@ -77,32 +66,19 @@ public final class SvmBlobDetector {
     private int[] todo = new int[0];
     private double[] prob = new double[0];
 
-    private long timedNanos = 0;
-    private long timedBlobs = 0;
-    private int timedFrames = 0;
-    private long worstNanos = 0;
-
     /**
      * @param boxLo the colour box the mask was cut with, lower Y,U,V bound
      * @param boxHi upper bound, inclusive
      */
     public SvmBlobDetector(Scalar boxLo, Scalar boxHi) {
-        this(boxLo, boxHi, DEFAULT_WORKERS);
-    }
-
-    /**
-     * @param workers extra scoring threads; 0 scores everything on the calling thread
-     */
-    public SvmBlobDetector(Scalar boxLo, Scalar boxHi, int workers) {
-        this.workers = Math.max(0, workers);
-        features = new BlobFeatures[this.workers + 1];
-        f = new double[this.workers + 1][BlobSvm.N_FEATURES];
+        features = new BlobFeatures[WORKERS + 1];
+        f = new double[WORKERS + 1][BlobSvm.N_FEATURES];
         int[] lo = {(int) boxLo.val[0], (int) boxLo.val[1], (int) boxLo.val[2]};
         int[] hi = {(int) boxHi.val[0], (int) boxHi.val[1], (int) boxHi.val[2]};
-        for (int k = 0; k <= this.workers; k++) {
+        for (int k = 0; k <= WORKERS; k++) {
             features[k] = new BlobFeatures(lo, hi);
         }
-        pool = this.workers == 0 ? null : Executors.newFixedThreadPool(this.workers, r -> {
+        pool = WORKERS == 0 ? null : Executors.newFixedThreadPool(WORKERS, r -> {
             Thread t = new Thread(r, "svm-blob");
             t.setDaemon(true);
             return t;
@@ -114,8 +90,7 @@ public final class SvmBlobDetector {
      * @param yuv  the CV_8UC3 Y,U,V frame the mask came from
      * @return every component of {@link #MIN_AREA}-{@link #MAX_AREA} px, scored
      */
-    public List<BallCandidate> findCandidates(Mat mask, Mat yuv, int frameIndex, long timestampUs) {
-        long t0 = System.nanoTime();
+    public List<BallCandidate> findCandidates(Mat mask, Mat yuv) {
         int count = Imgproc.connectedComponentsWithStats(mask, labels, stats, centroids);
         List<BallCandidate> out = new ArrayList<>();
 
@@ -142,7 +117,7 @@ public final class SvmBlobDetector {
             yuv.get(0, 0, yuvBytes);
             labels.get(0, 0, labelInts);
 
-            final int shares = (pool == null || n < PARALLEL_MIN_BLOBS) ? 1 : workers + 1;
+            final int shares = (pool == null || n < PARALLEL_MIN_BLOBS) ? 1 : WORKERS + 1;
             final int total = n;
             pending.clear();
             for (int k = 1; k < shares; k++) {
@@ -163,15 +138,9 @@ public final class SvmBlobDetector {
 
             for (int j = 0; j < n; j++) {
                 int i = todo[j];
-                out.add(new BallCandidate(frameIndex, timestampUs, ce[2 * i], ce[2 * i + 1],
-                        st[i * sc + Imgproc.CC_STAT_AREA],
-                        st[i * sc + Imgproc.CC_STAT_LEFT], st[i * sc + Imgproc.CC_STAT_TOP],
-                        st[i * sc + Imgproc.CC_STAT_WIDTH], st[i * sc + Imgproc.CC_STAT_HEIGHT],
-                        prob[j]));
+                out.add(new BallCandidate(ce[2 * i], ce[2 * i + 1], prob[j]));
             }
         }
-
-        logTiming(System.nanoTime() - t0, n);
         return out;
     }
 
@@ -187,22 +156,6 @@ public final class SvmBlobDetector {
                     st[b + Imgproc.CC_STAT_WIDTH], st[b + Imgproc.CC_STAT_HEIGHT],
                     st[b + Imgproc.CC_STAT_AREA], x)
                     ? BlobSvm.probability(x) : 0.0;
-        }
-    }
-
-    private void logTiming(long dt, int blobs) {
-        timedNanos += dt;
-        timedBlobs += blobs;
-        worstNanos = Math.max(worstNanos, dt);
-        if (++timedFrames == LOG_EVERY) {
-            Log.d(TAG, String.format(Locale.US,
-                    "last %d frames: %.1f blobs/frame, %.2f ms/frame mean, %.2f ms worst (%d threads)",
-                    timedFrames, (double) timedBlobs / timedFrames,
-                    timedNanos / 1e6 / timedFrames, worstNanos / 1e6, workers + 1));
-            timedNanos = 0;
-            timedBlobs = 0;
-            timedFrames = 0;
-            worstNanos = 0;
         }
     }
 
