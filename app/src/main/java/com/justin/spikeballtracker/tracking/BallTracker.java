@@ -35,8 +35,6 @@ public class BallTracker {
     private final int[]         slotNh              = new int[CAP];
     private final int[]         slotN               = new int[CAP];
 
-    private OccupancyGrid narrowGrid = new OccupancyGrid();
-    private OccupancyGrid wideGrid = new OccupancyGrid();
     private final List<Track> tracks = new ArrayList<>();
 
     private final List<BallCandidate> liveN = new ArrayList<>();
@@ -54,16 +52,12 @@ public class BallTracker {
         slotUs[s] = tUs;
         slotHas[s] = false;
 
+        // Static clutter is already gone: the occupancy grid runs in front of
+        // the blob SVM (SvmBlobDetector), so every candidate here is live.
         liveN.clear();
-        for (BallCandidate c : narrow){
-            if (!narrowGrid.isStatic(c.x, c.y)) liveN.add(c);
-        }
-        narrowGrid.update(narrow);
+        liveN.addAll(narrow);
         liveW.clear();
-        for (BallCandidate c : wide){
-            if (!wideGrid.isStatic(c.x, c.y)) liveW.add(c);
-        }
-        wideGrid.update(wide);
+        liveW.addAll(wide);
 
         boolean[] takenN = new boolean[liveN.size()];
         boolean[] takenW = new boolean[liveW.size()];
@@ -217,8 +211,6 @@ public class BallTracker {
 
     public void reset(){
         tracks.clear();
-        narrowGrid = new OccupancyGrid();
-        wideGrid = new OccupancyGrid();
         java.util.Arrays.fill(slotFrame, -1);
         latest = null;
     }

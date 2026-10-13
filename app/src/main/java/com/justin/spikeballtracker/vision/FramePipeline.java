@@ -242,6 +242,7 @@ public final class FramePipeline {
         ralliesReported = 0;
 
         motionDetector.reset();
+        svmBlobDetector.reset();        // the occupancy grid lives in front of the SVM
         tracker.reset();
         cachedNetBox = null;                                        // the old box describes the old framing
         cachedNetZone = null;

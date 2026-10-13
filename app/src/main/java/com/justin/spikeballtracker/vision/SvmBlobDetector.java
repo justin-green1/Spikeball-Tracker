@@ -1,6 +1,7 @@
 package com.justin.spikeballtracker.vision;
 
 import com.justin.spikeballtracker.tracking.BallCandidate;
+import com.justin.spikeballtracker.tracking.OccupancyGrid;
 
 import org.opencv.core.Mat;
 import org.opencv.core.Scalar;
@@ -27,6 +28,12 @@ import java.util.concurrent.Future;
  * are mostly clutter: on frames 901-5400 of S1C01, S3C01 and s5c04 (box B),
  * 15-39 px blobs were 45-61 % of all blobs, while the ball on tracked
  * flights fell in that range in only 2-10 % of its sightings.
+ *
+ * <p>Static clutter is dropped before scoring (13 Oct 2026): an
+ * {@link OccupancyGrid} in front of the SVM learns from every in-range blob,
+ * and a blob whose cell is static is neither scored nor returned. The grid is
+ * read before the frame's update, as the offline study that chose this
+ * position ran it (data/results/grid_position/REPORT.md).
  *
  * <p>Cost: the frame and the label image are read out of OpenCV once per
  * frame, and everything per blob is plain Java ({@link BlobFeatures}, then
@@ -65,6 +72,10 @@ public final class SvmBlobDetector {
     private int[] st = new int[0];
     private double[] ce = new double[0];
     private int[] todo = new int[0];
+    private int[] live = new int[0];
+
+    /** Static-clutter memory; replaced by {@link #reset()}. */
+    private OccupancyGrid grid = new OccupancyGrid();
     private double[] prob = new double[0];
 
     /**
@@ -89,7 +100,8 @@ public final class SvmBlobDetector {
     /**
      * @param mask single-channel 8-bit mask, colour box AND motion (non-zero = foreground)
      * @param yuv  the CV_8UC3 Y,U,V frame the mask came from
-     * @return every component of {@link #MIN_AREA}-{@link #MAX_AREA} px, scored
+     * @return every component of {@link #MIN_AREA}-{@link #MAX_AREA} px outside
+     *         the grid's static cells, scored
      */
     public List<BallCandidate> findCandidates(Mat mask, Mat yuv) {
         int count = Imgproc.connectedComponentsWithStats(mask, labels, stats, centroids);
@@ -100,6 +112,7 @@ public final class SvmBlobDetector {
         if (ce.length < count * 2) ce = new double[count * 2];
         if (todo.length < count) {
             todo = new int[count];
+            live = new int[count];
             prob = new double[count];
         }
         stats.get(0, 0, st);
@@ -110,6 +123,22 @@ public final class SvmBlobDetector {
             int a = st[i * sc + Imgproc.CC_STAT_AREA];
             if (a >= MIN_AREA && a <= MAX_AREA) todo[n++] = i;
         }
+
+        // Occupancy grid: read every blob's cell first, then learn from all of them.
+        int nLive = 0;
+        for (int j = 0; j < n; j++) {
+            int i = todo[j];
+            if (!grid.isStatic(ce[2 * i], ce[2 * i + 1])) live[nLive++] = i;
+        }
+        grid.nextFrame();
+        for (int j = 0; j < n; j++) {
+            int i = todo[j];
+            grid.hit(ce[2 * i], ce[2 * i + 1]);
+        }
+        int[] swap = todo;
+        todo = live;
+        live = swap;
+        n = nLive;
 
         if (n > 0) {
             final int w = yuv.cols(), h = yuv.rows();
@@ -158,6 +187,11 @@ public final class SvmBlobDetector {
                     st[b + Imgproc.CC_STAT_AREA], x)
                     ? BlobSvm.probability(x) : 0.0;
         }
+    }
+
+    /** Forgets the static clutter; call when the camera's view changes (background reset). */
+    public void reset() {
+        grid = new OccupancyGrid();
     }
 
     public void release() {
