@@ -28,6 +28,14 @@ public class BallTracker {
      * still be filled in the output once the ball reappears. Was 3.5 frames.
      */
     private static final long   DROP_AFTER_US       = 516_667L;
+    /**
+     * A track with fewer than 3 points is not yet a flight, and its young gate
+     * grows with time (1200 px/s). Given the full 15-frame allowance, a stray
+     * point could wait 11 frames and then take the ball from up to 440 px away,
+     * seeding a track whose fit never recovers. So young tracks keep the old
+     * 3.5-frame limit; only tracks of 3+ points get the occlusion allowance.
+     */
+    private static final long   YOUNG_DROP_AFTER_US = 116_667L;
 
     // confirmation --
     private static final int    MIN_POINTS          = 6;
@@ -101,7 +109,8 @@ public class BallTracker {
         Iterator<Track> it = tracks.iterator();
         while (it.hasNext()){
             Track t = it.next();
-            if(tUs - t.lastUs() > DROP_AFTER_US) {it.remove(); continue; }
+            long limit = t.size() < 3 ? YOUNG_DROP_AFTER_US : DROP_AFTER_US;
+            if(tUs - t.lastUs() > limit) {it.remove(); continue; }
             if(t.size() >= MIN_POINTS){
                 Track.Shape shape = t.shape();
                 t.confirmed = shape.rms <= MAX_RMS
