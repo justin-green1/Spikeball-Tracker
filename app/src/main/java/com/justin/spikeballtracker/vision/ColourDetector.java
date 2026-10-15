@@ -37,9 +37,8 @@ public class ColourDetector {
      * <p>The SVM must be trained on blobs cut with this box: a tighter box
      * trims ball edges, which shifts the shape and colour features.
      */
-    public static final Scalar LO = new Scalar(0, 35, 128);
-    public static final Scalar HI = new Scalar(255, 126, 171);
-
+    public static final Scalar LO = new Scalar(0, 35, 129);
+    public static final Scalar HI = new Scalar(255, 124, 171);
     private final Mat colourMask = new Mat();
 
     /**
