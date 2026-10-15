@@ -19,7 +19,6 @@ public final class Track {
     private double a, b, c;
     private boolean dirty = true;
 
-    protected int narrowHits = 0;
     protected boolean confirmed = false;
 
     public Track (int frameIndex, long tUs, double x, double y){

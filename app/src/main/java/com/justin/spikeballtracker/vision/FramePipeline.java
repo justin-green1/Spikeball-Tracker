@@ -112,20 +112,14 @@ public final class FramePipeline {
         }
 
         // Detection: the colour box ANDed with the motion mask (shadows kept),
-        // every blob scored by the SVM. Narrow candidates are those with
-        // P(ball) >= NARROW_THRESHOLD, wide those with P(ball) >= WIDE_THRESHOLD,
-        // so narrow is a subset of wide.
+        // then every blob scored by the SVM; the candidates are those at or
+        // above SvmBlobDetector.THRESHOLD.
         Core.bitwise_and(colourDetector.processFrame(yuv),
                 motionDetector.processFrame(yuv), ballMask);
-        List<BallCandidate> narrowCandidates = new ArrayList<>();
-        List<BallCandidate> wideCandidates = new ArrayList<>();
-        for (BallCandidate c : svmBlobDetector.findCandidates(ballMask, yuv)) {
-            if (c.pBall >= BlobSvm.NARROW_THRESHOLD) narrowCandidates.add(c);
-            if (c.pBall >= BlobSvm.WIDE_THRESHOLD) wideCandidates.add(c);
-        }
+        List<BallCandidate> candidates = svmBlobDetector.findCandidates(ballMask, yuv);
 
         // Tracking.
-        tracker.process(index, timestampUs, narrowCandidates, wideCandidates);
+        tracker.process(index, timestampUs, candidates);
 
         // Net.
         updateNet(timestampUs);

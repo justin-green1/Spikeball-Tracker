@@ -15,13 +15,12 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 /**
- * Connected components of the widened-box ball mask, each scored by
- * {@link BlobSvm}.
+ * Connected components of the ball mask (blobs), each scored by
+ * {@link BlobSvm}; those scoring at least {@link #THRESHOLD} are the
+ * candidates, the one stream the tracker follows.
  *
- * <p>Returns every component in the area range with its P(ball); the caller
- * splits them into narrow and wide streams by threshold. Components whose
- * features cannot be computed (fewer than 3 in-box pixels, which the study
- * skipped) get P(ball) = 0.
+ * <p>Blobs whose features cannot be computed (fewer than 3 in-box pixels,
+ * which the study skipped) get P(ball) = 0, so they are never candidates.
  *
  * <p>The SVM was trained on 40-400 px blobs only, and {@link #MIN_AREA}
  * matches that floor (raised from 15 on 13 Oct 2026). Below 40 px the blobs
@@ -49,6 +48,15 @@ public final class SvmBlobDetector {
 
     private static final int MIN_AREA = 40;
     private static final int MAX_AREA = 400;
+
+    /**
+     * P(ball) a blob needs to be a candidate (15 Oct 2026; replaces the
+     * narrow 0.35 / wide 0.085 pair in {@link BlobSvm}, which is generated
+     * and still carries them). On the 30 536 labelled box-A blobs it keeps
+     * 97.3 % of balls and lets 204 not-balls through (precision 91 %); 0.085
+     * kept 98.1 % with 308, 0.35 kept 95.7 % with 84.
+     */
+    public static final double THRESHOLD = 0.15;
 
     /** Extra threads for busy frames; the calling thread takes a share too. */
     private static final int WORKERS =
@@ -100,8 +108,8 @@ public final class SvmBlobDetector {
     /**
      * @param mask single-channel 8-bit mask, colour box AND motion (non-zero = foreground)
      * @param yuv  the CV_8UC3 Y,U,V frame the mask came from
-     * @return every component of {@link #MIN_AREA}-{@link #MAX_AREA} px outside
-     *         the grid's static cells, scored
+     * @return the candidates: components of {@link #MIN_AREA}-{@link #MAX_AREA} px
+     *         outside the grid's static cells with P(ball) at least {@link #THRESHOLD}
      */
     public List<BallCandidate> findCandidates(Mat mask, Mat yuv) {
         int count = Imgproc.connectedComponentsWithStats(mask, labels, stats, centroids);
@@ -167,6 +175,7 @@ public final class SvmBlobDetector {
             }
 
             for (int j = 0; j < n; j++) {
+                if (prob[j] < THRESHOLD) continue;
                 int i = todo[j];
                 out.add(new BallCandidate(ce[2 * i], ce[2 * i + 1], prob[j]));
             }

@@ -7,15 +7,13 @@ import java.util.List;
 public class BallTracker {
 
     // gates --
-    private static final double NARROW_GATE_PX      = 14.0;
-    private static final double WIDE_GATE_PX        = 8.0;
+    private static final double GATE_PX             = 14.0;
     private static final double YOUNG_SPEED_PX_S    = 1200.0;
     private static final double SEED_DV_PX_S       = 750.0;
     private static final long   DROP_AFTER_US       = 116_667L;
 
     // confirmation --
-    private static final int    MIN_POINTS          = 10;
-    private static final int    MIN_POINTS_NARROW   = 6;
+    private static final int    MIN_POINTS          = 6;
     private static final double MIN_CURV            = 315.0;
     private static final double MAX_CURV            = 1350.0;
     private static final double MIN_SPAN            = 60.0;
@@ -32,13 +30,11 @@ public class BallTracker {
     private final boolean[]     slotHas             = new boolean[CAP];
     private final double[]      slotX               = new double[CAP];
     private final double[]      slotY               = new double[CAP];
-    private final int[]         slotNh              = new int[CAP];
     private final int[]         slotN               = new int[CAP];
 
     private final List<Track> tracks = new ArrayList<>();
 
-    private final List<BallCandidate> liveN = new ArrayList<>();
-    private final List<BallCandidate> liveW = new ArrayList<>();
+    private final List<BallCandidate> live = new ArrayList<>();
 
     private Output latest = null;
 
@@ -46,7 +42,11 @@ public class BallTracker {
         java.util.Arrays.fill(slotFrame, -1);
     }
 
-    public void process(int frameIndex, long tUs, List <BallCandidate> narrow, List<BallCandidate> wide){
+    /**
+     * One frame's candidates: blobs the SVM scored at or above
+     * {@code SvmBlobDetector.THRESHOLD}, static clutter already removed.
+     */
+    public void process(int frameIndex, long tUs, List<BallCandidate> candidates){
         int s = frameIndex % CAP;
         slotFrame[s] = frameIndex;
         slotUs[s] = tUs;
@@ -54,17 +54,14 @@ public class BallTracker {
 
         // Static clutter is already gone: the occupancy grid runs in front of
         // the blob SVM (SvmBlobDetector), so every candidate here is live.
-        liveN.clear();
-        liveN.addAll(narrow);
-        liveW.clear();
-        liveW.addAll(wide);
+        live.clear();
+        live.addAll(candidates);
 
-        boolean[] takenN = new boolean[liveN.size()];
-        boolean[] takenW = new boolean[liveW.size()];
+        boolean[] taken = new boolean[live.size()];
 
-        tracks.sort((a,b) -> a.narrowHits != b.narrowHits
-                ? Integer.compare(b.narrowHits, a.narrowHits)
-                : Integer.compare(b.size(), a.size()));
+        // Longest track first: it gets first pick of the candidates. The sort
+        // is stable, so equal lengths keep their order from the last frame.
+        tracks.sort((a,b) -> Integer.compare(b.size(), a.size()));
 
         for (Track t : tracks){
             long dtUs = tUs - t.lastUs();
@@ -73,23 +70,12 @@ public class BallTracker {
             boolean young = t.size() < 3;
             double youngGate = YOUNG_SPEED_PX_S * dtUs / 1e6;
 
-            if (tryExtend(t, liveN, takenN, young ? youngGate : NARROW_GATE_PX, px, py, frameIndex, tUs)){
-                t.narrowHits++;
-            }else{
-                tryExtend(t, liveW, takenW, young ? youngGate : WIDE_GATE_PX, px, py, frameIndex, tUs);
-            }
+            tryExtend(t, live, taken, young ? youngGate : GATE_PX, px, py, frameIndex, tUs);
         }
 
-        for(int i = 0; i < liveN.size(); i ++){
-            if(takenN[i] || tracks.size() >= MAX_TRACKS) continue;
-            BallCandidate c = liveN.get(i);
-            Track nt = new Track(frameIndex, tUs, c.x, c.y);
-            nt.narrowHits = 1;
-            tracks.add(nt);
-        }
-        for(int i = 0; i < liveW.size(); i ++){
-            if(takenW[i] || tracks.size() >= MAX_TRACKS) continue;
-            BallCandidate c = liveW.get(i);
+        for(int i = 0; i < live.size(); i ++){
+            if(taken[i] || tracks.size() >= MAX_TRACKS) continue;
+            BallCandidate c = live.get(i);
             tracks.add(new Track(frameIndex, tUs, c.x, c.y));
         }
 
@@ -97,9 +83,7 @@ public class BallTracker {
         while (it.hasNext()){
             Track t = it.next();
             if(tUs - t.lastUs() > DROP_AFTER_US) {it.remove(); continue; }
-            int need = t.narrowHits >= 1 ? MIN_POINTS_NARROW : MIN_POINTS;
-
-            if(t.size() >= need){
+            if(t.size() >= MIN_POINTS){
                 Track.Shape shape = t.shape();
                 t.confirmed = shape.rms <= MAX_RMS
                         && shape.curvature >= MIN_CURV && shape.curvature <= MAX_CURV
@@ -110,8 +94,7 @@ public class BallTracker {
         Track best = null;
         for(Track t : tracks){
             if(!t.confirmed) continue;
-            if(best == null || t.narrowHits > best.narrowHits
-                    || (t.narrowHits == best.narrowHits && t.size() > best.size())){
+            if(best == null || t.size() > best.size()){
                 best = t;
             }
         }
@@ -169,15 +152,10 @@ public class BallTracker {
                 y = t.predictY(slotUs[s]);
             }
 
-            boolean outranks = !slotHas[s]
-                    || t.narrowHits > slotNh[s]
-                    || (t.narrowHits == slotNh[s] && t.size() >= slotN[s]);
-
-            if (outranks){
+            if (!slotHas[s] || t.size() >= slotN[s]){
                 slotHas[s] = true;
                 slotX[s] = x;
                 slotY[s] = y;
-                slotNh[s] = t.narrowHits;
                 slotN[s] = t.size();
             }
         }
