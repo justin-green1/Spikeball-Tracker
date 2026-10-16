@@ -10,6 +10,7 @@ import androidx.camera.core.ExperimentalGetImage;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.core.Preview;
+import androidx.camera.core.ResolutionInfo;
 import androidx.camera.core.resolutionselector.AspectRatioStrategy;
 import androidx.camera.core.resolutionselector.ResolutionSelector;
 import androidx.camera.core.resolutionselector.ResolutionStrategy;
@@ -27,7 +28,6 @@ import com.justin.spikeballtracker.vision.FramePipeline;
 
 import org.opencv.core.Core;
 import org.opencv.core.Mat;
-import org.opencv.imgproc.Imgproc;
 
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -47,10 +47,16 @@ import java.util.concurrent.TimeUnit;
  * buffer — which is only true with the activity locked to landscape.
  *
  * <p>A second use case, {@link Preview}, runs alongside the analysis stream and
- * feeds {@link ReplayBuffer}'s encoder, which holds the last minute of 720p
+ * feeds {@link ReplayBuffer}'s encoder, which holds the last minute of 1080p
  * footage. Each confirmed rally's footage is copied out of it, so the rally
  * survives the minute rolling on. The two streams are independent: a slow
  * pipeline drops analysis frames but never recorded ones.
+ *
+ * <p>Both streams ask for 1920x1080. That is a request: CameraX picks the
+ * nearest size the device can run for this combination of streams, and the
+ * sizes it settled on are logged once bound. The analysis frames are resized
+ * plane by plane from whatever size arrives, so a different size changes the
+ * detail the detectors see but never breaks them.
  */
 public final class CameraSource {
 
@@ -58,17 +64,17 @@ public final class CameraSource {
 
     /** What the analysis stream asks for; the device supplies the nearest it has. */
     private static final android.util.Size ANALYSIS_TARGET =
-            new android.util.Size(1280, 720);
+            new android.util.Size(1920, 1080);
 
-    /** What the replay recording asks for. */
+    /** What the replay recording asks for: footage is kept at full resolution. */
     private static final android.util.Size RECORD_TARGET =
-            new android.util.Size(1280, 720);
+            new android.util.Size(1920, 1080);
 
     private final Context appContext;
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
     private final ReplayBuffer replayBuffer;
 
-    private final YuvFrameBuilder yuvBuilder = new YuvFrameBuilder();
+    private final YuvFrameBuilder yuvBuilder = new YuvFrameBuilder("camera");
     private final Mat rgb = new Mat();
     private final Mat rotated = new Mat();
 
@@ -121,7 +127,7 @@ public final class CameraSource {
                                 AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
                         .setResolutionStrategy(new ResolutionStrategy(
                                 ANALYSIS_TARGET,
-                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER))
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
                         .build();
 
                 ImageAnalysis analysis = new ImageAnalysis.Builder()
@@ -138,7 +144,7 @@ public final class CameraSource {
                                         AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
                                 .setResolutionStrategy(new ResolutionStrategy(
                                         RECORD_TARGET,
-                                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER))
+                                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
                                 .build())
                         .build();
                 replayBuffer.attachTo(recording);
@@ -157,10 +163,27 @@ public final class CameraSource {
                     cameraProvider.bindToLifecycle(
                             owner, CameraSelector.DEFAULT_BACK_CAMERA, analysis);
                 }
+                logBoundSize("analysis", analysis.getResolutionInfo(), ANALYSIS_TARGET);
+                logBoundSize("recording", recording.getResolutionInfo(), RECORD_TARGET);
             } catch (Exception e) {
                 Log.e(TAG, "camera bind failed", e);
             }
         }, ContextCompat.getMainExecutor(appContext));   // bindToLifecycle must be on main
+    }
+
+    /** Logs the size CameraX settled on for one stream, warning if it is not the one asked for. */
+    private static void logBoundSize(String stream, ResolutionInfo info,
+                                     android.util.Size requested) {
+        if (info == null) {
+            Log.i(TAG, stream + " stream not bound");
+            return;
+        }
+        android.util.Size actual = info.getResolution();
+        if (actual.equals(requested)) {
+            Log.i(TAG, stream + " stream bound at " + actual);
+        } else {
+            Log.w(TAG, stream + " stream bound at " + actual + ", not the requested " + requested);
+        }
     }
 
     public void stop() {
@@ -233,8 +256,9 @@ public final class CameraSource {
                 return;
             }
 
-            Mat yuv = yuvBuilder.build(image);
-            Imgproc.resize(yuv, yuv, FrameExtractor.TARGET_SIZE, 0, 0, Imgproc.INTER_AREA);
+            // Each plane resized directly to the working size. No range
+            // expansion: CameraX YUV is already full range.
+            Mat yuv = yuvBuilder.build(image, FrameExtractor.TARGET_SIZE);
 
             // getTimestamp() is nanoseconds from an arbitrary epoch. Rebasing on
             // the first frame is what makes the pipeline's ten-second initial

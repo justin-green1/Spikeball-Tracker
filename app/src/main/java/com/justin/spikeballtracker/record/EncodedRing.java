@@ -5,9 +5,9 @@ import java.nio.ByteBuffer;
 /**
  * The last few tens of seconds of encoded H.264 access units, held in RAM.
  *
- * <p>Why encoded rather than raw: a raw 1280x720 YUV420 frame is ~1.4 MB, so a
- * minute at 30 fps would be ~2.5 GB. The same minute encoded at 5 Mbit/s is
- * ~38 MB. The ring stores the encoder's output verbatim, so saving is a remux,
+ * <p>Why encoded rather than raw: a raw 1920x1080 YUV420 frame is ~3.1 MB, so a
+ * minute at 30 fps would be ~5.6 GB. The same minute encoded at 10 Mbit/s is
+ * ~75 MB. The ring stores the encoder's output verbatim, so saving is a remux,
  * never a re-encode, and costs no quality.
  *
  * <p>Storage is one preallocated byte array used as a circular buffer, plus a

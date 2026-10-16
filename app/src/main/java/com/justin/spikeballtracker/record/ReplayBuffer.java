@@ -26,7 +26,7 @@ import java.util.concurrent.Executor;
  * the analysis stream, and its surface is the hardware H.264 encoder's input
  * surface. The camera writes straight into the encoder, so no pixels touch
  * Java or OpenCV. That keeps the recording at the full camera frame rate
- * and native 1280x720 however slow the detectors are, at the price of
+ * and native 1920x1080 however slow the detectors are, at the price of
  * the recorded frames being the camera's parallel stream rather than the exact
  * frames the analyser saw. Both streams come off the same sensor, on the same
  * clock.
@@ -68,7 +68,7 @@ public final class ReplayBuffer {
     private static final long CLOCK_MISMATCH_US = 1_000_000L;
 
     private static final String MIME = MediaFormat.MIMETYPE_VIDEO_AVC;
-    private static final int BIT_RATE = 5_000_000;          // ~38 MB per minute at 720p
+    private static final int BIT_RATE = 10_000_000;         // ~75 MB per minute at 1080p
     private static final int FRAME_RATE = 30;               // a hint to the encoder; timestamps rule
     private static final int I_FRAME_INTERVAL_S = 1;        // clip start granularity
     private static final int MAX_FPS_FOR_SLOTS = 60;        // sizes the packet metadata ring
@@ -78,7 +78,7 @@ public final class ReplayBuffer {
     private final Handler encoderHandler;
     private final Executor encoderExecutor;
 
-    /** Allocated on first use, so an app that never opens the camera never pays ~50 MB. */
+    /** Allocated on first use, so an app that never opens the camera never pays ~100 MB. */
     private volatile EncodedRing ring = null;
 
     /** Stream headers (csd-0/csd-1) for what is in the ring. Guarded by the ring's lock. */
@@ -225,12 +225,25 @@ public final class ReplayBuffer {
         double retainS = RETAIN_US / 1_000_000.0;
         int capacity = (int) (BIT_RATE / 8.0 * retainS * BYTE_HEADROOM);
         int slots = (int) Math.ceil(retainS) * MAX_FPS_FOR_SLOTS;
-        try {
-            ring = new EncodedRing(capacity, slots, RETAIN_US);
-        } catch (OutOfMemoryError e) {
-            Log.e(TAG, "not enough heap for a " + (capacity / (1024 * 1024))
-                    + " MB replay ring; replay disabled");
+        // At 1080p the full ring is ~100 MB of Java heap. If the heap cannot
+        // spare that, a half-size ring still works: the byte limit evicts
+        // first, so it simply holds about half as many seconds.
+        for (int attempt = capacity; attempt >= capacity / 2; attempt /= 2) {
+            try {
+                ring = new EncodedRing(attempt, slots, RETAIN_US);
+                if (attempt < capacity) {
+                    Log.w(TAG, "heap too small for a " + (capacity / (1024 * 1024))
+                            + " MB replay ring; using " + (attempt / (1024 * 1024))
+                            + " MB, about " + Math.round(attempt / (BIT_RATE / 8.0 * BYTE_HEADROOM))
+                            + " s of 1080p");
+                }
+                return ring;
+            } catch (OutOfMemoryError e) {
+                Log.w(TAG, "could not allocate a " + (attempt / (1024 * 1024)) + " MB replay ring"
+                        + " (heap limit " + (Runtime.getRuntime().maxMemory() / (1024 * 1024)) + " MB)");
+            }
         }
+        Log.e(TAG, "not enough heap for a replay ring; replay disabled");
         return ring;
     }
 

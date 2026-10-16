@@ -3,6 +3,8 @@ package com.justin.spikeballtracker.video;
 import android.content.Context;
 import android.media.Image;
 import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.net.Uri;
@@ -12,7 +14,6 @@ import org.opencv.core.Core;
 import org.opencv.core.CvType;
 import org.opencv.core.Mat;
 import org.opencv.core.Size;
-import org.opencv.imgproc.Imgproc;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -21,8 +22,14 @@ public class FrameExtractor {
     private final Context context;
     private static final String TAG = "FrameExtractor";
     private static final long BUFFER_TIMEOUT_US = 10_000;
-    private final YuvFrameBuilder yuvBuilder = new YuvFrameBuilder();
+    private final YuvFrameBuilder yuvBuilder = new YuvFrameBuilder("video");
+
+    /** The pipeline's working resolution, shared with the camera path. */
     public static final Size TARGET_SIZE = new Size(854, 480);
+
+    /** The decode size the pipeline is designed around; other sizes are handled, and logged. */
+    private static final int PREFERRED_WIDTH = 1920;
+    private static final int PREFERRED_HEIGHT = 1080;
 
     /**
      * True when the decoder's samples are limited range and must be expanded.
@@ -78,6 +85,7 @@ public class FrameExtractor {
             extractor.selectTrack(trackIndex);
             MediaFormat format = extractor.getTrackFormat(trackIndex);
             expandToFullRange = !isFullRange(format);
+            logStreamSize(format);
 
             codec = createDecoder(format);
             decodeLoop(extractor, codec, listener);
@@ -141,12 +149,57 @@ public class FrameExtractor {
         return -1;
     }
 
-    /** Creates and starts a decoder for the given track format. */
+    /**
+     * Logs the stream's coded size against the 1920x1080 the pipeline is
+     * designed around.
+     *
+     * <p>MediaCodec cannot be asked for a different output size: in buffer
+     * mode a decoder always delivers the stream's own resolution. So a
+     * 1920x1080 clip decodes at 1920x1080, and anything else decodes at its
+     * own size and is resized from there by {@link YuvFrameBuilder}.
+     */
+    private static void logStreamSize(MediaFormat format) {
+        int w = format.getInteger(MediaFormat.KEY_WIDTH);
+        int h = format.getInteger(MediaFormat.KEY_HEIGHT);
+        int rotation = format.containsKey(MediaFormat.KEY_ROTATION)
+                ? format.getInteger(MediaFormat.KEY_ROTATION) : 0;
+        Log.i(TAG, "video track " + w + "x" + h + ", rotation " + rotation
+                + ", " + (isFullRange(format) ? "full" : "limited") + " range");
+        if (w != PREFERRED_WIDTH || h != PREFERRED_HEIGHT) {
+            Log.w(TAG, "track is " + w + "x" + h + ", not " + PREFERRED_WIDTH + "x"
+                    + PREFERRED_HEIGHT + "; the decoder cannot rescale, so frames are"
+                    + " resized from " + w + "x" + h);
+        }
+        if (rotation != 0) {
+            Log.w(TAG, "track asks for " + rotation + " degree rotation on display; frames are"
+                    + " processed as stored, unrotated");
+        }
+    }
+
+    /**
+     * Creates and starts a decoder for the given track format, choosing one
+     * that declares support for the track's size and asking it for flexible
+     * YUV 4:2:0 output, which is what {@link MediaCodec#getOutputImage} needs.
+     */
     private MediaCodec createDecoder(MediaFormat format) throws IOException {
         String mime = format.getString(MediaFormat.KEY_MIME);
-        MediaCodec codec = MediaCodec.createDecoderByType(mime);
+        String name = new MediaCodecList(MediaCodecList.REGULAR_CODECS).findDecoderForFormat(format);
+
+        MediaCodec codec;
+        if (name != null) {
+            codec = MediaCodec.createByCodecName(name);
+        } else {
+            Log.w(TAG, "no decoder declares support for " + format.getInteger(MediaFormat.KEY_WIDTH)
+                    + "x" + format.getInteger(MediaFormat.KEY_HEIGHT) + " " + mime
+                    + "; trying the default, which may fail or drop frames");
+            codec = MediaCodec.createDecoderByType(mime);
+        }
+
+        format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
         codec.configure(format, null, null, 0);   // null Surface = raw pixel output
         codec.start();
+        Log.i(TAG, "decoder " + codec.getName());
         return codec;
     }
 
@@ -165,7 +218,11 @@ public class FrameExtractor {
             }
 
             int outIndex = codec.dequeueOutputBuffer(bufferInfo, BUFFER_TIMEOUT_US);
-            if (outIndex >= 0) {
+            if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                // Carries the real output size, crop and strides; YuvFrameBuilder
+                // reads the same from each Image, this is for the log.
+                Log.i(TAG, "decoder output format " + codec.getOutputFormat());
+            } else if (outIndex >= 0) {
                 Mat frame = null;
                 if (bufferInfo.size > 0) {
                     Image image = codec.getOutputImage(outIndex);
@@ -225,9 +282,13 @@ public class FrameExtractor {
         }
     }
 
+    /**
+     * The decoded Image as the pipeline's CV_8UC3 Y,U,V frame at
+     * {@link #TARGET_SIZE}: each plane resized directly from its native size,
+     * then the limited-to-full range expansion if the stream needs it.
+     */
     private Mat buildFrame(Image image) {
-        Mat yuv = yuvBuilder.build(image);
-        Imgproc.resize(yuv, yuv, TARGET_SIZE, 0, 0, Imgproc.INTER_AREA);
+        Mat yuv = yuvBuilder.build(image, TARGET_SIZE);
         if (expandToFullRange) {
             Core.LUT(yuv, fullRangeLut, yuv);
         }
