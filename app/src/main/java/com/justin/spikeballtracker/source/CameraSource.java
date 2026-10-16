@@ -19,6 +19,7 @@ import androidx.core.content.ContextCompat;
 import androidx.lifecycle.LifecycleOwner;
 
 import com.google.common.util.concurrent.ListenableFuture;
+import com.justin.spikeballtracker.BackgroundThread;
 import com.justin.spikeballtracker.record.RallyFootage;
 import com.justin.spikeballtracker.record.ReplayBuffer;
 import com.justin.spikeballtracker.tracking.RallyDetector;
@@ -30,17 +31,17 @@ import org.opencv.core.Core;
 import org.opencv.core.Mat;
 
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Live camera frames, converted into the pipeline's working format and run
  * through the same {@link FramePipeline} the recorded-video path uses.
  *
- * <p>Conversion, detection and rendering all happen on one private thread.
- * That thread is deliberately not shared with the video path, whose task holds
- * its executor for the length of a whole clip.
+ * <p>Conversion, detection and rendering all happen on the shared
+ * {@link BackgroundThread}, as do the replay encoder's callbacks. The public
+ * methods may be called from the UI thread: they post to the background
+ * thread, or, for binding the camera, to the main thread as CameraX
+ * requires. All other state is touched only on the background thread, so
+ * it needs no locks.
  *
  * <p>The analysis buffer is always landscape regardless of how the phone is
  * held, and the detectors' geometry priors assume the world is upright in that
@@ -49,8 +50,11 @@ import java.util.concurrent.TimeUnit;
  * <p>A second use case, {@link Preview}, runs alongside the analysis stream and
  * feeds {@link ReplayBuffer}'s encoder, which holds the last minute of 1080p
  * footage. Each confirmed rally's footage is copied out of it, so the rally
- * survives the minute rolling on. The two streams are independent: a slow
- * pipeline drops analysis frames but never recorded ones.
+ * survives the minute rolling on. A slow pipeline drops analysis frames
+ * (only the latest is kept). The recording comes from the camera straight
+ * into the encoder, but its output is collected on the same background
+ * thread, so it only stays smooth while no single job holds that thread
+ * for more than about a tenth of a second.
  *
  * <p>Both streams ask for 1920x1080. That is a request: CameraX picks the
  * nearest size the device can run for this combination of streams, and the
@@ -71,7 +75,7 @@ public final class CameraSource {
             new android.util.Size(1920, 1080);
 
     private final Context appContext;
-    private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
+    private final BackgroundThread background;
     private final ReplayBuffer replayBuffer;
 
     private final YuvFrameBuilder yuvBuilder = new YuvFrameBuilder("camera");
@@ -80,40 +84,43 @@ public final class CameraSource {
 
     private ProcessCameraProvider cameraProvider = null;
 
-    /**
-     * One camera session's pipeline and clock. Swapped as a unit through a
-     * single volatile field, so a frame can never be processed by one
-     * session's pipeline against another session's clock.
-     */
+    /** One camera session's pipeline and clock. */
     private static final class Run {
         final FramePipeline pipeline = new FramePipeline();
 
         /**
          * Sensor time of this session's first and newest frames, in ns.
-         * Analyser thread only. The pipeline's timestamps count from the
-         * first; the replay ring is stamped with raw sensor time.
+         * The pipeline's timestamps count from the first; the replay ring is
+         * stamped with raw sensor time.
          */
         long firstTimestampNs = -1L;
         long lastTimestampNs = -1L;
     }
 
-    private volatile Run run = null;
-    private volatile FrameSink sink = null;
-    private volatile RallyListener rallyListener = null;
+    // Background thread only.
+    private Run run = null;
+    private FrameSink sink = null;
+    private RallyListener rallyListener = null;
 
-    public CameraSource(Context context) {
+    public CameraSource(Context context, BackgroundThread background) {
         this.appContext = context.getApplicationContext();
-        this.replayBuffer = new ReplayBuffer();
+        this.background = background;
+        this.replayBuffer = new ReplayBuffer(background);
     }
 
-    /** Told about each confirmed rally, with its footage, on the camera thread; null for none. */
+    /** Told about each confirmed rally, with its footage, on the background thread; null for none. */
     public void setRallyListener(RallyListener listener) {
-        this.rallyListener = listener;
+        background.post(() -> rallyListener = listener);
     }
 
     /** Caller must already hold CAMERA permission. */
     public void start(LifecycleOwner owner, FrameSink frameSink) {
-        this.sink = frameSink;
+        // A fresh session, set up before the camera is bound and so before any frame.
+        background.post(() -> {
+            endRun();
+            run = new Run();
+            sink = frameSink;
+        });
 
         ListenableFuture<ProcessCameraProvider> providerFuture =
                 ProcessCameraProvider.getInstance(appContext);
@@ -136,7 +143,7 @@ public final class CameraSource {
                         .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                         .build();
 
-                analysis.setAnalyzer(cameraExecutor, this::onFrame);
+                analysis.setAnalyzer(background.executor(), this::onFrame);
 
                 Preview recording = new Preview.Builder()
                         .setResolutionSelector(new ResolutionSelector.Builder()
@@ -150,7 +157,6 @@ public final class CameraSource {
                 replayBuffer.attachTo(recording);
 
                 cameraProvider.unbindAll();
-                replaceRun(new Run());
 
                 try {
                     cameraProvider.bindToLifecycle(
@@ -191,55 +197,40 @@ public final class CameraSource {
             ContextCompat.getMainExecutor(appContext)
                     .execute(() -> cameraProvider.unbindAll());
         }
-        replaceRun(null);
-        sink = null;
+        background.post(() -> {
+            endRun();
+            sink = null;
+        });
     }
 
-    /**
-     * Frees everything, in an order that survives frames still in flight.
-     *
-     * <p>{@code shutdown}, not {@code shutdownNow}: the queued releases are the
-     * whole point, and cancelling them would leak the native buffers.
-     */
+    /** Stops and frees everything. Posted, so it runs after any frame already queued. */
     public void release() {
         stop();
-        cameraExecutor.execute(() -> {
+        background.post(() -> {
             yuvBuilder.release();
             rgb.release();
             rotated.release();
         });
-        cameraExecutor.shutdown();
-        try {
-            if (!cameraExecutor.awaitTermination(1, TimeUnit.SECONDS)) {
-                Log.w(TAG, "camera executor did not drain in time");
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
         replayBuffer.release();
     }
 
     /**
-     * Swaps the session, finishing the old one's rallies and releasing its
-     * pipeline on the thread that used it. The release is queued behind any
-     * frame still in flight.
+     * Ends the current session: a rally still in progress is confirmed now,
+     * and the pipeline is freed. The ring is kept after the camera stops, so
+     * the rally's footage can still be copied. Background thread only.
      */
-    private void replaceRun(Run next) {
+    private void endRun() {
         Run previous = run;
-        run = next;
-        if (previous != null) {
-            RallyListener listener = rallyListener;
-            cameraExecutor.execute(() -> {
-                // A rally still in progress is confirmed now. The ring is kept
-                // after the camera stops, so its footage can still be copied.
-                try {
-                    reportRallies(previous, previous.pipeline.finish(), listener);
-                } catch (Exception e) {
-                    Log.e(TAG, "rally finish failed", e);
-                }
-                previous.pipeline.release();
-            });
+        run = null;
+        if (previous == null) {
+            return;
         }
+        try {
+            reportRallies(previous, previous.pipeline.finish(), rallyListener);
+        } catch (Exception e) {
+            Log.e(TAG, "rally finish failed", e);
+        }
+        previous.pipeline.release();
     }
 
     @OptIn(markerClass = ExperimentalGetImage.class)
@@ -248,7 +239,7 @@ public final class CameraSource {
             Run current = run;
             FrameSink target = sink;
             if (current == null || target == null) {
-                return;   // a frame still in flight after stop()
+                return;   // a frame queued before stop() ran
             }
 
             Image image = proxy.getImage();
@@ -284,7 +275,7 @@ public final class CameraSource {
 
     /**
      * If anyone is listening, copies each rally's footage out of the replay
-     * ring and hands both over. Analyser thread only.
+     * ring and hands both over. Background thread only.
      *
      * <p>The copy is a few ms per 10 s of rally, taken once per rally, seconds
      * after it ended; at worst the analyser drops a frame for it.
@@ -331,9 +322,10 @@ public final class CameraSource {
 
     /** Clears the learned background, net and tracks; does nothing when the camera is not running. */
     public void requestBackgroundReset() {
-        Run current = run;
-        if (current != null) {
-            current.pipeline.requestReset();
-        }
+        background.post(() -> {
+            if (run != null) {
+                run.pipeline.requestReset();
+            }
+        });
     }
 }

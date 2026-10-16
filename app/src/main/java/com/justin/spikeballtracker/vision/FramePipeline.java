@@ -16,7 +16,6 @@ import org.opencv.imgproc.Imgproc;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * One frame of the detection pipeline, shared by the recorded-video path and
@@ -66,7 +65,7 @@ public final class FramePipeline {
 
     // ---------------------------------------------------------------- run state
 
-    private final AtomicBoolean resetRequested = new AtomicBoolean(false);
+    private boolean resetRequested = false;
 
     private int frameIndex = 0;
     private long warmStartUs = 0L;
@@ -107,7 +106,8 @@ public final class FramePipeline {
         if (index == 0) {
             warmStartUs = timestampUs;
         }
-        if (resetRequested.getAndSet(false)) {
+        if (resetRequested) {
+            resetRequested = false;
             applyReset(timestampUs);
         }
 
@@ -148,9 +148,9 @@ public final class FramePipeline {
         return drainRallies();
     }
 
-    /** Asks for a background reset; applied at the start of the next frame, on the pipeline thread. */
+    /** Asks for a background reset, applied at the start of the next frame. Pipeline thread only. */
     public void requestReset() {
-        resetRequested.set(true);
+        resetRequested = true;
     }
 
     /** Frees every native Mat this pipeline owns. */

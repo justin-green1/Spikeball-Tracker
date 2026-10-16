@@ -4,11 +4,11 @@ import android.content.Context;
 import android.media.MediaMuxer;
 import android.util.Log;
 
+import com.justin.spikeballtracker.BackgroundThread;
+
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 /**
  * Holds the last rally's footage, from either source, and saves it to
@@ -18,28 +18,33 @@ import java.util.concurrent.Executors;
  * clear it, so it can be saved more than once. It lives in RAM, so it is gone
  * when the app closes.
  *
- * <p>{@link #keep} may be called from any thread. Saves run one at a time on
- * a thread of their own, against the footage held at the moment of the tap.
+ * <p>{@link #keep} and {@link #hasRally} are called on the background thread
+ * (sources report rallies there). {@link #saveLast} may be called from any
+ * thread; the save itself runs on the background thread, against the footage
+ * held when it starts. While a save is writing (a fraction of a second for a
+ * typical rally) the thread does nothing else, so the camera drops a few
+ * analysis frames or the video pauses briefly.
  */
 public final class RallySaver {
 
     private static final String TAG = "RallySaver";
 
     public interface SaveCallback {
-        /** Called on the save thread. */
+        /** Called on the background thread. */
         void onSaved(String displayName, double seconds);
 
-        /** Called on the save thread, or on the caller's thread when there is nothing to save. */
+        /** Called on the background thread. */
         void onFailed(String reason);
     }
 
     private final Context appContext;
-    private final ExecutorService saveExecutor = Executors.newSingleThreadExecutor();
+    private final BackgroundThread background;
 
-    private volatile RallyFootage last = null;
+    private RallyFootage last = null;   // background thread only
 
-    public RallySaver(Context context) {
+    public RallySaver(Context context, BackgroundThread background) {
         this.appContext = context.getApplicationContext();
+        this.background = background;
     }
 
     /** Makes {@code footage} the last rally. A null (footage not captured) keeps the previous one. */
@@ -56,12 +61,12 @@ public final class RallySaver {
 
     /** Saves the last rally as {@code rally_<date-time>.mp4}. Returns at once. */
     public void saveLast(SaveCallback callback) {
-        RallyFootage footage = last;
-        if (footage == null) {
-            callback.onFailed("no rally yet");
-            return;
-        }
-        saveExecutor.execute(() -> {
+        background.post(() -> {
+            RallyFootage footage = last;
+            if (footage == null) {
+                callback.onFailed("no rally yet");
+                return;
+            }
             String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date());
             String name = "rally_" + stamp + ".mp4";
             try {
@@ -72,11 +77,6 @@ public final class RallySaver {
                 callback.onFailed(e.getMessage() != null ? e.getMessage() : e.toString());
             }
         });
-    }
-
-    /** Lets a save already running finish. */
-    public void release() {
-        saveExecutor.shutdown();
     }
 
     private long write(RallyFootage footage, String name) throws Exception {

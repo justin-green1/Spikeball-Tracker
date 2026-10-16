@@ -7,7 +7,7 @@ import com.justin.spikeballtracker.tracking.RallyDetector;
  * Told about each rally once the detector has confirmed it, a few seconds
  * after the rally ends (or when the run stops, for one still in progress).
  *
- * <p>Called on the source's own worker thread.
+ * <p>Called on the app's background thread.
  */
 public interface RallyListener {
 

@@ -19,8 +19,8 @@ import java.nio.ByteBuffer;
  * since been evicted, rather than silently reading overwritten bytes.
  *
  * <p>Deliberately free of Android types so it can be unit-tested on a plain JVM.
- * Every public method is synchronized; the writer (encoder thread) and the
- * reader (camera analyser thread, copying out one rally) share the lock.
+ * Not thread safe: the writer (encoder callbacks) and the reader (copying out
+ * one rally) both run on the app's one background thread.
  */
 public final class EncodedRing {
 
@@ -55,7 +55,7 @@ public final class EncodedRing {
     }
 
     /** Drops everything. Sequence numbers keep counting, so stale readers still fail safely. */
-    public synchronized void clear() {
+    public void clear() {
         headSeq = tailSeq;
         headPos = 0;
         usedBytes = 0;
@@ -68,7 +68,7 @@ public final class EncodedRing {
      *            buffer's position is left unchanged
      * @return false if the packet is larger than the whole ring and was dropped
      */
-    public synchronized boolean add(ByteBuffer src, long pts, boolean isKeyFrame) {
+    public boolean add(ByteBuffer src, long pts, boolean isKeyFrame) {
         int n = src.remaining();
         if (n > data.length) {
             return false;
@@ -127,7 +127,7 @@ public final class EncodedRing {
      *
      * @return null when no keyframe falls before {@code toPts}
      */
-    public synchronized Plan planRange(long fromPts, long toPts) {
+    public Plan planRange(long fromPts, long toPts) {
         long start = -1;
         long end = -1;   // exclusive
         for (long seq = headSeq; seq < tailSeq; seq++) {
@@ -184,7 +184,7 @@ public final class EncodedRing {
      *
      * @return null if any of them has been evicted since the plan was made
      */
-    public synchronized Snapshot snapshot(Plan plan) {
+    public Snapshot snapshot(Plan plan) {
         if (plan.startSeq < headSeq || plan.endSeq > tailSeq || plan.endSeq <= plan.startSeq) {
             return null;
         }
@@ -219,11 +219,11 @@ public final class EncodedRing {
     }
 
     /** Timestamp of the newest packet held; only meaningful when {@link #count()} > 0. */
-    public synchronized long newestPtsUs() {
+    public long newestPtsUs() {
         return ptsUs[slot(tailSeq - 1)];
     }
 
-    public synchronized int count() {
+    public int count() {
         return (int) (tailSeq - headSeq);
     }
 

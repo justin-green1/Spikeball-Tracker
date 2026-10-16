@@ -3,8 +3,6 @@ package com.justin.spikeballtracker.record;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
-import android.os.Handler;
-import android.os.HandlerThread;
 import android.util.Log;
 import android.util.Size;
 import android.view.Surface;
@@ -13,10 +11,11 @@ import androidx.annotation.NonNull;
 import androidx.camera.core.Preview;
 import androidx.camera.core.SurfaceRequest;
 
+import com.justin.spikeballtracker.BackgroundThread;
+
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.Executor;
 
 /**
  * Keeps the last minute of camera footage in RAM, and copies a confirmed
@@ -36,13 +35,11 @@ import java.util.concurrent.Executor;
  * into a {@link BufferedRally} of their own, which {@link RallySaver} remuxes
  * into an MP4 with no re-encode.
  *
- * <p>Threads:
- * <ul>
- *   <li><b>encoder thread</b> — surface requests, all MediaCodec callbacks,
- *       session teardown. Owns {@link #current} and {@link #live}.</li>
- *   <li><b>caller of {@link #copyRally}</b> (the camera's analyser thread) —
- *       only reads the ring, under its lock.</li>
- * </ul>
+ * <p>Everything here runs on the shared {@link BackgroundThread}: surface
+ * requests, all MediaCodec callbacks, session teardown, and
+ * {@link #copyRally} (called by the camera's frame handler). So none of the
+ * state needs a lock. The encoder's output waits behind whatever else the
+ * thread is doing; the encoder has a few output buffers to absorb that.
  *
  * <p>Lifetime: the ring is kept when the camera stops, so the rally confirmed
  * at the stop can still be copied. It is cleared when the next camera session
@@ -74,30 +71,25 @@ public final class ReplayBuffer {
     private static final int MAX_FPS_FOR_SLOTS = 60;        // sizes the packet metadata ring
     private static final double BYTE_HEADROOM = 1.25;       // VBR overshoots on busy scenes
 
-    private final HandlerThread encoderThread;
-    private final Handler encoderHandler;
-    private final Executor encoderExecutor;
+    private final BackgroundThread background;
 
     /** Allocated on first use, so an app that never opens the camera never pays ~100 MB. */
-    private volatile EncodedRing ring = null;
+    private EncodedRing ring = null;
 
-    /** Stream headers (csd-0/csd-1) for what is in the ring. Guarded by the ring's lock. */
+    /** Stream headers (csd-0/csd-1) for what is in the ring. */
     private MediaFormat outputFormat = null;
-    private volatile int rotationDegrees = 0;
+    private int rotationDegrees = 0;
 
-    private Session current = null;                        // encoder thread only
-    private final List<Session> live = new ArrayList<>();  // encoder thread only
+    private Session current = null;
+    private final List<Session> live = new ArrayList<>();
 
-    public ReplayBuffer() {
-        this.encoderThread = new HandlerThread("ReplayEncoder");
-        this.encoderThread.start();
-        this.encoderHandler = new Handler(encoderThread.getLooper());
-        this.encoderExecutor = encoderHandler::post;
+    public ReplayBuffer(BackgroundThread background) {
+        this.background = background;
     }
 
     /** Routes the preview use case's frames into the encoder. Call before binding. */
     public void attachTo(Preview preview) {
-        preview.setSurfaceProvider(encoderExecutor, this::onSurfaceRequested);
+        preview.setSurfaceProvider(background.executor(), this::onSurfaceRequested);
     }
 
     /**
@@ -105,9 +97,7 @@ public final class ReplayBuffer {
      * The clip starts on the keyframe at or before {@code fromUs} (up to one
      * second earlier), and is cut short at either end by what the ring holds.
      *
-     * <p>Takes the ring's lock for the whole copy (a few ms per 10 s of
-     * footage), so the clip and its stream headers always describe the same
-     * camera session.
+     * <p>The copy takes a few ms per 10 s of footage. Background thread only.
      *
      * @param fromUs start, on the camera's sensor clock (ImageProxy timestamp / 1000)
      * @param toUs   end, same clock
@@ -121,47 +111,44 @@ public final class ReplayBuffer {
             Log.w(TAG, "nothing recorded; rally footage not kept");
             return null;
         }
-        synchronized (r) {
-            if (outputFormat == null || r.count() == 0) {
-                Log.w(TAG, "no encoded footage yet; rally footage not kept");
-                return null;
-            }
-
-            long skewUs = r.newestPtsUs() - nowUs;
-            if (Math.abs(skewUs) > CLOCK_MISMATCH_US) {
-                Log.w(TAG, "recording and analysis timestamps are " + skewUs / 1000
-                        + " ms apart, more than a clock's worth of latency; "
-                        + "shifting the rally onto the recording's clock");
-                fromUs += skewUs;
-                toUs += skewUs;
-            }
-
-            EncodedRing.Plan plan = r.planRange(fromUs, toUs);
-            EncodedRing.Snapshot packets = plan == null ? null : r.snapshot(plan);
-            if (packets == null) {
-                Log.w(TAG, "rally footage is no longer in the ring; not kept");
-                return null;
-            }
-            if (plan.firstPtsUs > fromUs) {
-                Log.w(TAG, "rally began before the oldest footage held; the clip starts "
-                        + (plan.firstPtsUs - fromUs) / 1000 + " ms late");
-            }
-            return new BufferedRally(packets, outputFormat, rotationDegrees);
+        if (outputFormat == null || r.count() == 0) {
+            Log.w(TAG, "no encoded footage yet; rally footage not kept");
+            return null;
         }
+
+        long skewUs = r.newestPtsUs() - nowUs;
+        if (Math.abs(skewUs) > CLOCK_MISMATCH_US) {
+            Log.w(TAG, "recording and analysis timestamps are " + skewUs / 1000
+                    + " ms apart, more than a clock's worth of latency; "
+                    + "shifting the rally onto the recording's clock");
+            fromUs += skewUs;
+            toUs += skewUs;
+        }
+
+        EncodedRing.Plan plan = r.planRange(fromUs, toUs);
+        EncodedRing.Snapshot packets = plan == null ? null : r.snapshot(plan);
+        if (packets == null) {
+            Log.w(TAG, "rally footage is no longer in the ring; not kept");
+            return null;
+        }
+        if (plan.firstPtsUs > fromUs) {
+            Log.w(TAG, "rally began before the oldest footage held; the clip starts "
+                    + (plan.firstPtsUs - fromUs) / 1000 + " ms late");
+        }
+        return new BufferedRally(packets, outputFormat, rotationDegrees);
     }
 
-    /** Stops any encoder and the encoder thread. */
+    /** Stops any encoder. Posted, so it runs after anything already queued. */
     public void release() {
-        encoderHandler.post(() -> {
+        background.post(() -> {
             for (Session s : new ArrayList<>(live)) {
                 s.end();
             }
             current = null;
         });
-        encoderThread.quitSafely();
     }
 
-    // --- encoder side (encoder thread) ---------------------------------------
+    // --- encoder side ---------------------------------------------------------
 
     private void onSurfaceRequested(@NonNull SurfaceRequest request) {
         EncodedRing r = ensureRing();
@@ -182,7 +169,7 @@ public final class ReplayBuffer {
         try {
             MediaCodec codec = MediaCodec.createEncoderByType(MIME);
             session = new Session(codec);
-            codec.setCallback(session, encoderHandler);    // must precede configure
+            codec.setCallback(session, background.handler());    // must precede configure
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
             session.surface = codec.createInputSurface();  // after configure, before start
             codec.start();
@@ -194,15 +181,13 @@ public final class ReplayBuffer {
 
         // A new encoder means new stream headers, so the old packets cannot
         // follow them into one file.
-        synchronized (r) {
-            r.clear();
-            outputFormat = null;
-        }
+        r.clear();
+        outputFormat = null;
         rotationDegrees = 0;
         current = session;
         live.add(session);
 
-        request.setTransformationInfoListener(encoderExecutor, info -> {
+        request.setTransformationInfoListener(background.executor(), info -> {
             if (current == session) {
                 rotationDegrees = info.getRotationDegrees();
             }
@@ -210,7 +195,7 @@ public final class ReplayBuffer {
 
         // The result arrives once the camera has stopped writing to the surface,
         // which is the only safe moment to tear the encoder down.
-        request.provideSurface(session.surface, encoderExecutor, result -> {
+        request.provideSurface(session.surface, background.executor(), result -> {
             session.end();
             if (current == session) {
                 current = null;
@@ -291,10 +276,7 @@ public final class ReplayBuffer {
         public void onOutputFormatChanged(@NonNull MediaCodec codec, @NonNull MediaFormat format) {
             // Arrives before the first packet and carries the SPS/PPS the muxer needs.
             if (current == this) {
-                EncodedRing r = ring;
-                synchronized (r) {
-                    outputFormat = format;
-                }
+                outputFormat = format;
             }
         }
 
