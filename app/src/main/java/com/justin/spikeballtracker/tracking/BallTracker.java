@@ -6,7 +6,7 @@ import java.util.List;
 
 /**
  * Follows the ball through one stream of candidates (blobs the SVM scored at
- * or above {@code SvmBlobDetector.THRESHOLD}), building tracks in stages.
+ * or above {@code BlobSvm.THRESHOLD}), building tracks in stages.
  *
  * <ol>
  *   <li><b>Seed</b> (1 point): any candidate no track used. On a later frame,
@@ -112,7 +112,7 @@ public class BallTracker {
 
     /**
      * One frame's candidates: blobs the SVM scored at or above
-     * {@code SvmBlobDetector.THRESHOLD}, static clutter already removed.
+     * {@code BlobSvm.THRESHOLD}, static clutter already removed.
      */
     public void process(int frameIndex, long tUs, List<BallCandidate> candidates){
         int s = frameIndex % CAP;

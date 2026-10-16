@@ -9,9 +9,11 @@ package com.justin.spikeballtracker.vision;
  * (C = 3.0, gamma = 0.03) behind a median imputer and a standard scaler. Do not
  * edit the numbers by hand; regenerate them if the model is retrained.
  *
- * <p>Training data: blobs cut as the app now cuts them -- colour box A
- * (0, 35, 128)-(255, 126, 171) AND the KNN mask, 40-400 px -- with features from
- * {@link BlobFeatures} itself. Labels: 2 165 hand-labelled balls, 1 823
+ * <p>Training data: blobs cut with colour box A (0, 35, 128)-(255, 126, 171)
+ * AND the KNN mask, 40-400 px, with features from {@link BlobFeatures} itself.
+ * The app runs box B (0, 35, 129)-(255, 124, 171), which lies inside box A, and
+ * keeps 30-400 px blobs, so in deployment the SVM sees a subset of its training
+ * colours and, below 40 px, sizes it was not trained on. Labels: 2 165 hand-labelled balls, 1 823
  * hand-labelled not-balls and 26 548 auto-labelled not-balls (every other blob
  * in a frame with a labelled ball; one ball is in play), partials excluded.
  * Split by whole clip within each session (train 18816 / val 6426 / test 5294 blobs);
@@ -32,14 +34,13 @@ public final class BlobSvm {
     public static final int N_FEATURES = 7;
 
     /**
-     * Thresholds on {@link #probability}, chosen on the validation clips.
-     * Narrow: the highest F1 with precision at least the narrow colour box's
-     * (val P 0.989 R 0.990; test P 0.959 R 0.952). Wide: 0.085, kept from the first
-     * model by choice -- the recall-matching rule wanted 0.001, which passes 18 %
-     * of blobs to save 4 of 437 val balls (val P 0.945 R 0.997; test P 0.899 R 0.970).
+     * The one classification threshold on {@link #probability}: a blob scoring
+     * at least this is a candidate (one candidate stream since 15 Oct 2026,
+     * replacing narrow 0.35 / wide 0.085). Sessions weighted equally:
+     * val P 0.963 R 0.996; test P 0.927 R 0.963. On all 30536 labelled blobs it
+     * keeps 97.3 % of balls with 204 not-balls (precision 91 %).
      */
-    public static final double NARROW_THRESHOLD = 0.35;
-    public static final double WIDE_THRESHOLD = 0.085;
+    public static final double THRESHOLD = 0.15;
 
     // ---------------------------------------------------------------- preprocessing
 

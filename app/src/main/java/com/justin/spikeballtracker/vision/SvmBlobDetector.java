@@ -16,7 +16,7 @@ import java.util.concurrent.Future;
 
 /**
  * Connected components of the ball mask (blobs), each scored by
- * {@link BlobSvm}; those scoring at least {@link #THRESHOLD} are the
+ * {@link BlobSvm}; those scoring at least {@link BlobSvm#THRESHOLD} are the
  * candidates, the one stream the tracker follows.
  *
  * <p>Blobs whose features cannot be computed (fewer than 3 in-box pixels,
@@ -52,15 +52,6 @@ public final class SvmBlobDetector {
 
     private static final int MIN_AREA = 30;
     private static final int MAX_AREA = 400;
-
-    /**
-     * P(ball) a blob needs to be a candidate (15 Oct 2026; replaces the
-     * narrow 0.35 / wide 0.085 pair in {@link BlobSvm}, which is generated
-     * and still carries them). On the 30 536 labelled box-A blobs it keeps
-     * 97.3 % of balls and lets 204 not-balls through (precision 91 %); 0.085
-     * kept 98.1 % with 308, 0.35 kept 95.7 % with 84.
-     */
-    public static final double THRESHOLD = 0.15;
 
     /** Extra threads for busy frames; the calling thread takes a share too. */
     private static final int WORKERS =
@@ -113,7 +104,7 @@ public final class SvmBlobDetector {
      * @param mask single-channel 8-bit mask, colour box AND motion (non-zero = foreground)
      * @param yuv  the CV_8UC3 Y,U,V frame the mask came from
      * @return the candidates: components of {@link #MIN_AREA}-{@link #MAX_AREA} px
-     *         outside the grid's static cells with P(ball) at least {@link #THRESHOLD}
+     *         outside the grid's static cells with P(ball) at least {@link BlobSvm#THRESHOLD}
      */
     public List<BallCandidate> findCandidates(Mat mask, Mat yuv) {
         int count = Imgproc.connectedComponentsWithStats(mask, labels, stats, centroids);
@@ -179,7 +170,7 @@ public final class SvmBlobDetector {
             }
 
             for (int j = 0; j < n; j++) {
-                if (prob[j] < THRESHOLD) continue;
+                if (prob[j] < BlobSvm.THRESHOLD) continue;
                 int i = todo[j];
                 out.add(new BallCandidate(ce[2 * i], ce[2 * i + 1], prob[j]));
             }

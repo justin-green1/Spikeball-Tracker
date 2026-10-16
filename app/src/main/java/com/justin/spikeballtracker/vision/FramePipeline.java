@@ -113,7 +113,7 @@ public final class FramePipeline {
 
         // Detection: the colour box ANDed with the motion mask (shadows kept),
         // then every blob scored by the SVM; the candidates are those at or
-        // above SvmBlobDetector.THRESHOLD.
+        // above BlobSvm.THRESHOLD.
         Core.bitwise_and(colourDetector.processFrame(yuv),
                 motionDetector.processFrame(yuv), ballMask);
         List<BallCandidate> candidates = svmBlobDetector.findCandidates(ballMask, yuv);
