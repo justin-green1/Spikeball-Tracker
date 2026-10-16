@@ -22,11 +22,15 @@ import java.util.concurrent.Future;
  * <p>Blobs whose features cannot be computed (fewer than 3 in-box pixels,
  * which the study skipped) get P(ball) = 0, so they are never candidates.
  *
- * <p>The SVM was trained on 40-400 px blobs only, and {@link #MIN_AREA}
- * matches that floor (raised from 15 on 13 Oct 2026). Below 40 px the blobs
- * are mostly clutter: on frames 901-5400 of S1C01, S3C01 and s5c04 (box B),
- * 15-39 px blobs were 45-61 % of all blobs, while the ball on tracked
- * flights fell in that range in only 2-10 % of its sightings.
+ * <p>{@link #MIN_AREA} is 30 px (16 Oct 2026; 40 px from 13 Oct, 15 before).
+ * The SVM was trained on 40-400 px blobs, so 30-39 px blobs are scored
+ * outside the sizes it has seen; it has not been retrained for them. The
+ * lower floor recovers small, distant balls: on S1C03's labelled rally
+ * frames, balls cut by the floor fell from 14.5 % to 10.9 %, and in the
+ * offline replay (five clips, old-SVM scores) per-frame tracking F1 rose by
+ * about 0.01 with no more false rallies. Below about 40 px most blobs are
+ * clutter (15-39 px blobs were 45-61 % of all blobs on frames 901-5400 of
+ * S1C01, S3C01 and s5c04, box B), which the tracker's shape test must reject.
  *
  * <p>Static clutter is dropped before scoring (13 Oct 2026): an
  * {@link OccupancyGrid} in front of the SVM learns from every in-range blob,
@@ -46,7 +50,7 @@ import java.util.concurrent.Future;
  */
 public final class SvmBlobDetector {
 
-    private static final int MIN_AREA = 40;
+    private static final int MIN_AREA = 30;
     private static final int MAX_AREA = 400;
 
     /**

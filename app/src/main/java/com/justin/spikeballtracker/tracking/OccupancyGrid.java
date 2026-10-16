@@ -13,7 +13,7 @@ import java.util.List;
  * {@value #WARMUP_FRAMES} frames.
  *
  * <p>Position (13 Oct 2026): the grid runs in front of the blob SVM, in
- * {@code SvmBlobDetector}. It learns from every 40-400 px blob, scored or not,
+ * {@code SvmBlobDetector}. It learns from every blob in its area range (30-400 px), scored or not,
  * and blobs in static cells are not scored at all. It used to sit in
  * {@link BallTracker}, one grid per stream, learning only from candidates the
  * SVM had accepted. An offline replay against ground truth on S1-S3
