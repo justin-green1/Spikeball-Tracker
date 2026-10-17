@@ -1,218 +1,212 @@
 package com.justin.spikeballtracker.vision;
 
+import android.content.res.AssetManager;
 import android.util.Log;
 
 import org.opencv.core.Core;
-import org.opencv.core.CvType;
 import org.opencv.core.Mat;
-import org.opencv.core.MatOfPoint;
+import org.opencv.core.MatOfByte;
 import org.opencv.core.Rect;
+import org.opencv.core.Scalar;
 import org.opencv.core.Size;
+import org.opencv.dnn.Dnn;
+import org.opencv.dnn.Net;
 import org.opencv.imgproc.Imgproc;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Locale;
 
 /**
- * Finds the net in a KNN background plate.
+ * Finds the net in a KNN background plate with a YOLO26-nano detector.
  *
- * <p>The only caller is {@link FramePipeline}, and both of its sources resize
- * every frame to 854x480 before the pipeline sees it, so the plate always
- * arrives at the working resolution. Nothing here resizes or maps coordinates
- * back: every pixel constant below is in 480p units, and the returned box is
- * already in plate (and so display) coordinates.
+ * <p>Replaces the edge-and-contour detector. Same contract: the only caller
+ * is {@link FramePipeline}, which hands over a CV_8UC3 Y,U,V plate at the
+ * working resolution (854x480), and gets back the net box in plate (and so
+ * display) coordinates, or null when there is no confident net.
+ *
+ * <p>The model ({@value #MODEL_ASSET} in the assets) was trained on exported
+ * background plates from sessions S1-S4 and S6, converted to colour the way
+ * this class does it (YUV to RGB), with one class, "net". It was exported
+ * from Ultralytics at a fixed 384x640 input without the built-in NMS: OpenCV
+ * 4.12's DNN module cannot load the end-to-end head (it has no TopK layer).
+ * The raw output is one column per anchor; the net is a single object, so the
+ * best-scoring anchor is the answer and no NMS is needed.
+ *
+ * <p>Preprocessing matches Ultralytics' letterbox exactly: scale the longest
+ * side to fit, bilinear resize, pad to 640x384 with grey 114, divide by 255.
+ * For an 854x480 plate that is a 640x360 image with 12 rows of padding above
+ * and below.
  */
 public class NetDetector {
     private static final String TAG = "NetDetector";
-    /** The only plate height {@link #detect} accepts; the pixel constants below assume it. */
-    private static final int WORK_HEIGHT = 480;
 
-    // ---------------------------------------------------------------------
-    // candidate parameters.
+    /** File name in app/src/main/assets. */
+    public static final String MODEL_ASSET = "yolo_net.onnx";
 
-    private static final double MIN_Y_FRACTION  = 0.69;
-    private static final int    MIN_BOX_WIDTH   = 75;
-    private static final int    MAX_BOX_WIDTH   = 220;
-    private static final double lowerThreshold  = 57.1;     // = upper / 2.09
-    private static final double upperThreshold  = 119.25;
-    private static final double sigmaSpace      = 152.8;    // has no effect at d = 5
-    private static final double sigmaColour     = 146.6;
-    private static final int    d               = 5;
-    private static final int    MORPH_HEIGHT    = 9;
-    private static final int    MORPH_WIDTH     = 25;
-    private static final double MAX_CX_OFFSET   = 0.14;
-    private static final double MIN_CY_FRACTION = 0.50;
-    private static final double MIN_DARKNESS    = -9.0;
-    private static final double MIN_SCORE       = 0.38;
-    //-----------------------------------------------------------------------
-    // scorer parameters
-    /** Where the net usually sits, and what shape it is, in a 480p frame. */
-    private static final double PRIOR_CX     = 0.50;
-    private static final double PRIOR_CY     = 0.75;
-    private static final double PRIOR_ASPECT = 4.2;
-    private static final double SIGMA_CX     = 0.25;
-    private static final double SIGMA_CY     = 0.20;
-    private static final double SIGMA_ASPECT = 1.0;
-    //------------------------------------------------------------------------
+    /** The network's fixed input size, as exported (imgsz = 384, 640). */
+    private static final int IN_W = 640;
+    private static final int IN_H = 384;
+    private static final double PAD_GREY = 114.0;
+
+    /** Output values per anchor: centre x, centre y, width, height, net confidence. */
+    private static final int ROWS = 5;
+
+    /**
+     * Below this the plate is treated as "no net", and the pipeline keeps the
+     * box it already has, so a missed attempt costs little. On 46 held-out
+     * session 5 images, raising the floor from 0.25 to 0.5 dropped the one
+     * clearly wrong box (confidence 0.38) and one correct, low-confidence
+     * box (40 hits at 0.25, 39 at 0.5).
+     */
+    private static final float MIN_CONFIDENCE = 0.5f;
+
+    /**
+     * The ONNX file, read once by {@link #loadModel} on the UI thread before
+     * any source exists. Each pipeline is built later, on the Analysis thread,
+     * from a job posted after that, so the post orders the write before every
+     * read and no lock is needed.
+     */
+    private static byte[] modelBytes;
+
+    /** Built on first use, on the pipeline's own thread; one per pipeline. */
+    private Net net;
+    private boolean netUnavailable;
+
     // ---- reusable buffers ----
-    private Mat integral = new Mat();
-    private double[] sum;
-    private int integralWidth;
+    private final Mat rgb     = new Mat();
+    private final Mat resized = new Mat();
+    private final Mat padded  = new Mat();
+
+    /**
+     * Reads the model from the app's assets. Call once, from
+     * {@code MainActivity.onCreate}, after OpenCV has loaded and before any
+     * frame source starts.
+     */
+    public static void loadModel(AssetManager assets) {
+        try (InputStream in = assets.open(MODEL_ASSET)) {
+            modelBytes = in.readAllBytes();
+            Log.i(TAG, "loaded " + MODEL_ASSET + " (" + modelBytes.length + " bytes)");
+        } catch (IOException e) {
+            Log.e(TAG, "could not read " + MODEL_ASSET + "; net detection is off", e);
+        }
+    }
 
     /**
      * @param plate CV_8UC3 Y,U,V background plate from the KNN model, at the
      *              working resolution (854x480)
-     * @return the net box in plate coordinates, or null if no candidate scores
-     *         high enough or the plate is not {@value #WORK_HEIGHT} rows high
+     * @return the net box in plate coordinates, or null if the model is
+     *         missing or its best box is less than {@link #MIN_CONFIDENCE}
      */
     public Rect detect(Mat plate) {
         if (plate == null || plate.empty()) return null;
+        Net n = net();
+        if (n == null) return null;
 
-        // Guards the "already at working resolution" contract. A source that
-        // skipped its resize would otherwise get boxes judged against 480p
-        // constants at the wrong scale, silently.
-        if (plate.rows() != WORK_HEIGHT) {
-            Log.w(TAG, "plate is " + plate.cols() + "x" + plate.rows()
-                    + ", expected " + WORK_HEIGHT + " rows; skipping detect");
-            return null;
-        }
-
-        Mat grey = new Mat();
-        Mat edges = new Mat();
-
+        long startNs = System.nanoTime();
+        Mat blob = null;
+        Mat out = null;
         try {
-            // Canny needs one channel, and in YUV that is simply the Y (luma) plane.
-            Core.extractChannel(plate, grey, 0);
-            extractEdges(grey, edges);
+            int w = plate.cols();
+            int h = plate.rows();
 
-            List<Rect> candidates = findCandidates(edges, grey, grey.cols(), grey.rows());
-            return pickBest(candidates, grey.cols(), grey.rows());
+            // Letterbox, as Ultralytics does it.
+            double r  = Math.min(IN_W / (double) w, IN_H / (double) h);
+            int nw    = (int) Math.round(w * r);
+            int nh    = (int) Math.round(h * r);
+            int padX  = (IN_W - nw) / 2;
+            int padY  = (IN_H - nh) / 2;
+
+            Imgproc.cvtColor(plate, rgb, Imgproc.COLOR_YUV2RGB);
+            Imgproc.resize(rgb, resized, new Size(nw, nh), 0, 0, Imgproc.INTER_LINEAR);
+            Core.copyMakeBorder(resized, padded,
+                    padY, IN_H - nh - padY, padX, IN_W - nw - padX,
+                    Core.BORDER_CONSTANT, new Scalar(PAD_GREY, PAD_GREY, PAD_GREY));
+
+            // Already RGB, so no channel swap.
+            blob = Dnn.blobFromImage(padded, 1.0 / 255.0, new Size(IN_W, IN_H),
+                    new Scalar(0, 0, 0), false, false);
+            n.setInput(blob);
+            out = n.forward();                      // 1 x 5 x anchors, float
+
+            int anchors = (int) (out.total() / ROWS);
+            float[] data = new float[ROWS * anchors];
+            out.get(new int[] {0, 0, 0}, data);     // row-major: all cx, all cy, ... all conf
+
+            int best = -1;
+            float bestConf = -1f;
+            int confRow = 4 * anchors;
+            for (int i = 0; i < anchors; i++) {
+                float c = data[confRow + i];
+                if (c > bestConf) {
+                    bestConf = c;
+                    best = i;
+                }
+            }
+
+            long ms = (System.nanoTime() - startNs) / 1_000_000L;
+            if (best < 0 || bestConf < MIN_CONFIDENCE) {
+                Log.i(TAG, String.format(Locale.US,
+                        "no net (best confidence %.2f), %d ms", bestConf, ms));
+                return null;
+            }
+
+            // Back from the 640x384 input to plate coordinates.
+            double cx = data[best];
+            double cy = data[anchors + best];
+            double bw = data[2 * anchors + best];
+            double bh = data[3 * anchors + best];
+            double x0 = clamp((cx - bw / 2 - padX) / r, 0, w);
+            double y0 = clamp((cy - bh / 2 - padY) / r, 0, h);
+            double x1 = clamp((cx + bw / 2 - padX) / r, 0, w);
+            double y1 = clamp((cy + bh / 2 - padY) / r, 0, h);
+
+            Rect box = new Rect((int) Math.round(x0), (int) Math.round(y0),
+                    (int) Math.round(x1 - x0), (int) Math.round(y1 - y0));
+            Log.i(TAG, String.format(Locale.US,
+                    "net %dx%d at (%d, %d), confidence %.2f, %d ms",
+                    box.width, box.height, box.x, box.y, bestConf, ms));
+            return box.width > 0 && box.height > 0 ? box : null;
 
         } finally {
-            grey.release();
-            edges.release();
+            if (blob != null) blob.release();
+            if (out != null) out.release();
         }
     }
 
-    /**
-     * Edge map for the candidate search: a bilateral filter flattens texture
-     * while keeping strong edges, Canny finds them, and a wide, short
-     * elliptical close joins the net rim's broken edge runs into one contour.
-     */
-    private void extractEdges(Mat src, Mat dst){
-        Mat filtered = new Mat();
-        Mat kernel = null;
-        try{
-            Imgproc.bilateralFilter(src, filtered, d, sigmaColour, sigmaSpace);
-            Imgproc.Canny(filtered, dst, lowerThreshold, upperThreshold);
+    /** Frees the buffers. The network itself is freed by the garbage collector. */
+    public void release() {
+        rgb.release();
+        resized.release();
+        padded.release();
+        net = null;
+    }
 
-            kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, new Size(MORPH_WIDTH,MORPH_HEIGHT));
-            Imgproc.morphologyEx(dst,dst, Imgproc.MORPH_CLOSE, kernel);
-        }finally {
-            filtered.release();
-            if (kernel != null) kernel.release();
+    private Net net() {
+        if (net != null || netUnavailable) return net;
+        if (modelBytes == null) {
+            Log.e(TAG, "model not loaded (NetDetector.loadModel was not called)");
+            netUnavailable = true;
+            return null;
         }
-    }
-
-    private List<Rect> findCandidates(Mat edges, Mat grey, int frameWidth, int frameHeight){
-        List<Rect> candidates = new ArrayList<>();
-        List<MatOfPoint> contours = new ArrayList<>();
-        Mat hierarchy = new Mat();
-
-        try{
-            Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE);
-
-            // ---- once per frame, before the contour loop ----
-            Imgproc.integral(grey, integral, CvType.CV_64F);       // grey = the Y plane, BEFORE bilateral
-            integralWidth = integral.cols();
-            int need = (int) integral.total();
-            if (sum == null || sum.length != need) sum = new double[need];
-            integral.get(0, 0, sum);                               // one JNI copy, then plain Java maths
-
-            for (MatOfPoint contour : contours) {
-                Rect box = Imgproc.boundingRect(contour);
-
-                // cheapest and most selective first
-                if (box.width < MIN_BOX_WIDTH || box.width > MAX_BOX_WIDTH) continue;
-                if (box.y + box.height < MIN_Y_FRACTION * frameHeight) continue;
-
-                double cx = (box.x + box.width  / 2.0) / frameWidth;
-                double cy = (box.y + box.height / 2.0) / frameHeight;
-
-                if (Math.abs(cx - 0.5) > MAX_CX_OFFSET) continue;
-                if (cy < MIN_CY_FRACTION)               continue;
-
-                // darkness contrast: compare the box against a ring around it
-                int m   = Math.max(8, (int) (0.35 * box.height));
-                int ox0 = Math.max(0, box.x - m);
-                int oy0 = Math.max(0, box.y - m);
-                int ox1 = Math.min(frameWidth,  box.x + box.width  + m);
-                int oy1 = Math.min(frameHeight, box.y + box.height + m);
-
-                double boxSum   = rectSum(box.x, box.y, box.x + box.width, box.y + box.height);
-                double outerSum = rectSum(ox0, oy0, ox1, oy1);
-
-                int boxN  = box.width * box.height;
-                int ringN = (ox1 - ox0) * (oy1 - oy0) - boxN;
-                if (ringN <= 0) continue;
-
-                double boxMean  = boxSum / boxN;
-                double ringMean = (outerSum - boxSum) / ringN;
-
-                if (ringMean - boxMean < MIN_DARKNESS) continue;
-
-                candidates.add(box);
-            }
-
-            return candidates;
+        MatOfByte buffer = new MatOfByte(modelBytes);
+        try {
+            long startNs = System.nanoTime();
+            net = Dnn.readNetFromONNX(buffer);
+            net.setPreferableBackend(Dnn.DNN_BACKEND_OPENCV);
+            net.setPreferableTarget(Dnn.DNN_TARGET_CPU);
+            Log.i(TAG, "network ready in " + (System.nanoTime() - startNs) / 1_000_000L + " ms");
+        } catch (Exception e) {
+            Log.e(TAG, "could not build the network; net detection is off", e);
+            net = null;
+            netUnavailable = true;
+        } finally {
+            buffer.release();
         }
-        finally{
-            for(MatOfPoint c : contours) c.release();
-            hierarchy.release();
-        }
-
+        return net;
     }
 
-    private double rectSum(int x0, int y0, int x1, int y1) {
-        return sum[y1 * integralWidth + x1] - sum[y0 * integralWidth + x1]
-                - sum[y1 * integralWidth + x0] + sum[y0 * integralWidth + x0];
-    }
-
-    /** Picks the most net-like candidate, or null if there are none. */
-    private Rect pickBest(List<Rect> candidates, int frameWidth, int frameHeight) {
-        Rect best = null;
-        double bestScore = -1.0;
-        for (Rect candidate : candidates) {
-            double score = score(candidate, frameWidth, frameHeight);
-            if (score > bestScore && score > MIN_SCORE) {
-                bestScore = score;
-                best = candidate;
-            }
-        }
-        return best;
-    }
-
-    /**
-     * How net-like a candidate is: near the middle horizontally, low in the frame,
-     * and clearly wider than it is tall. Each term is 1.0 at the ideal value and
-     * falls off smoothly, so nothing is ever excluded outright - a candidate that is
-     * off on one term can still win if it is strong on the others.
-     */
-    private double score(Rect box, int frameWidth, int frameHeight) {
-        double cx = (box.x + box.width / 2.0) / frameWidth;
-        double cy = (box.y + box.height / 2.0) / frameHeight;
-        double aspect = box.width / (double) Math.max(box.height, 1);
-
-        double horizontal = gaussian(cx, PRIOR_CX, SIGMA_CX);
-        double vertical = gaussian(cy, PRIOR_CY, SIGMA_CY);
-        double shape = gaussian(Math.log(aspect / PRIOR_ASPECT), 0.0, SIGMA_ASPECT);
-
-        return horizontal * vertical * shape;
-    }
-
-    /** 1.0 at the mean, falling off with distance. */
-    private static double gaussian(double value, double mean, double sigma) {
-        double z = (value - mean) / sigma;
-        return Math.exp(-z * z);
+    private static double clamp(double v, double lo, double hi) {
+        return Math.max(lo, Math.min(hi, v));
     }
 }
