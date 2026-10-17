@@ -158,6 +158,7 @@ public final class FramePipeline {
         motionDetector.release();
         colourDetector.release();
         svmBlobDetector.release();
+        netDetector.release();
         ballMask.release();
         background.release();
     }

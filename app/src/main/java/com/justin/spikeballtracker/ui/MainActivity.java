@@ -25,6 +25,7 @@ import com.justin.spikeballtracker.record.RallySaver;
 import com.justin.spikeballtracker.source.CameraSource;
 import com.justin.spikeballtracker.source.VideoPlayer;
 import com.justin.spikeballtracker.tracking.RallyDetector;
+import com.justin.spikeballtracker.vision.NetDetector;
 
 import org.opencv.android.OpenCVLoader;
 import org.opencv.android.Utils;
@@ -82,6 +83,9 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         frameImageView = findViewById(R.id.frame_image_view);
+
+        // Before any source exists: each pipeline builds its own network from these bytes.
+        NetDetector.loadModel(getAssets());
 
         background = new BackgroundThread();
         videoPlayer = new VideoPlayer(this, background);
