@@ -1,11 +1,15 @@
 package com.justin.spikeballtracker.source;
 
 import android.content.Context;
+import android.database.Cursor;
 import android.net.Uri;
-import android.os.SystemClock;
+import android.provider.OpenableColumns;
 import android.util.Log;
 
-import com.justin.spikeballtracker.BackgroundThread;
+import com.justin.spikeballtracker.WorkerThread;
+import com.justin.spikeballtracker.log.Formats;
+import com.justin.spikeballtracker.log.Json;
+import com.justin.spikeballtracker.log.RunLog;
 import com.justin.spikeballtracker.record.FileRally;
 import com.justin.spikeballtracker.record.RallyFootage;
 import com.justin.spikeballtracker.tracking.RallyDetector;
@@ -15,93 +19,149 @@ import com.justin.spikeballtracker.vision.FramePipeline;
 import org.opencv.core.Mat;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Plays a recorded clip through the pipeline at its true frame rate.
  *
- * <p>Runs on the shared {@link BackgroundThread}, one frame per message:
- * decode a frame, run the pipeline, show it, then schedule the next frame
- * for the moment its presentation timestamp says it is due. Between frames
- * the thread is free for anything else. Stopping just removes the next
- * scheduled frame; since stop runs on the same thread, it can never land in
- * the middle of one.
+ * <p>A clip runs as one job on the Analysis {@link WorkerThread}: a plain
+ * decode-process-wait loop that holds the thread until the clip ends or is
+ * stopped. The camera shares that thread, which is fine because the two
+ * sources never run at the same time.
+ *
+ * <p>Stopping is the one thing that has to reach across threads, since a
+ * posted "stop" would wait behind the clip it is meant to stop. Each clip
+ * gets a number; {@link #play} and {@link #stop} move the current number on,
+ * and a clip keeps going only while its number is still current. That one
+ * atomic counter is the only shared state here.
  *
  * <p>A confirmed rally's footage is a {@link FileRally}: a time range of the
  * clip itself, cut out only if it is saved.
- *
- * <p>The public methods may be called from any thread; they post to the
- * background thread. Everything else runs only there.
  */
 public final class VideoPlayer {
 
     private static final String TAG = "VideoPlayer";
 
+    /** Longest single sleep, so a stop is noticed within this even across a gap in the clip. */
+    private static final long MAX_SLEEP_MS = 50;
+
     private final Context appContext;
-    private final BackgroundThread background;
+    private final WorkerThread analysis;
     private final FrameExtractor frameExtractor;
 
-    // Background thread only.
-    private Playback current = null;
-    private RallyListener rallyListener = null;
+    /** Bumped by every play() and stop(); a clip plays only while its number is current. */
+    private final AtomicInteger currentClip = new AtomicInteger();
 
-    public VideoPlayer(Context context, BackgroundThread background) {
+    private RallyListener rallyListener = null;   // Analysis thread only
+
+    public VideoPlayer(Context context, WorkerThread analysis) {
         this.appContext = context.getApplicationContext();
-        this.background = background;
+        this.analysis = analysis;
         this.frameExtractor = new FrameExtractor(context);
     }
 
-    /** Told about each confirmed rally of a clip that plays to the end; null for none. */
+    /** Told about each confirmed rally of a clip that plays to the end, on the Analysis thread; null for none. */
     public void setRallyListener(RallyListener listener) {
-        background.post(() -> rallyListener = listener);
+        analysis.post(() -> rallyListener = listener);
     }
 
     /** Stops any clip playing and starts this one. */
     public void play(Uri videoUri, FrameSink sink) {
-        background.post(() -> {
-            end(false);
-            if (!frameExtractor.open(videoUri)) {
-                return;
-            }
-            current = new Playback(videoUri, sink);
-            background.post(current);
-        });
+        int clip = currentClip.incrementAndGet();
+        analysis.post(() -> playClip(clip, videoUri, sink));
     }
 
-    /** Stops the clip playing, if any. A stopped clip reports no rally still in progress. */
+    /** Stops the clip playing, if any, within one frame. */
     public void stop() {
-        background.post(() -> end(false));
+        currentClip.incrementAndGet();
     }
 
-    /** Stops and frees everything. Posted, so it runs after anything already queued. */
+    /** Stops playback and frees the decoder's buffers once the clip has let go of the thread. */
     public void release() {
-        background.post(() -> {
-            end(false);
-            frameExtractor.release();
-        });
+        stop();
+        analysis.post(frameExtractor::release);
     }
 
-    /**
-     * Ends the current clip. Background thread only.
-     *
-     * @param finished true when the clip played to the end; only then is the
-     *                 last rally, confirmed by finishing, reported
-     */
-    private void end(boolean finished) {
-        Playback p = current;
-        if (p == null) {
-            return;
+    private boolean isCurrent(int clip) {
+        return currentClip.get() == clip;
+    }
+
+    /** Runs a whole clip. Holds the Analysis thread until it ends or is stopped. */
+    private void playClip(int clip, Uri videoUri, FrameSink sink) {
+        if (!isCurrent(clip)) {
+            return;   // stopped, or replaced by another clip, before it started
         }
-        current = null;
-        background.handler().removeCallbacks(p);
-        if (finished) {
-            try {
-                reportRallies(p.pipeline.finish(), p.videoUri);
-            } catch (Exception e) {
-                Log.e(TAG, "rally finish failed", e);
+        RunLog log = RunLog.open(appContext, "video");
+        if (log != null) {
+            log.write(FramePipeline.header("video", log)
+                    .field("video", displayName(videoUri))
+                    .field("uri", videoUri.toString())
+                    .field("note", "src = t = the video's presentation time in us")
+                    .end().toString());
+        }
+        FramePipeline pipeline = new FramePipeline(log);
+        Mat displayMat = new Mat();
+        PlaybackClock clock = new PlaybackClock(clip);
+        int[] frames = {0};
+        boolean completed = false;
+
+        try {
+            frameExtractor.streamFrames(videoUri, (frame, timestampUs) -> {
+                if (!isCurrent(clip)) {
+                    return false;   // stop requested: leave the decode loop
+                }
+                if (frames[0]++ == 0 && log != null) {
+                    logStream(log);
+                }
+                // For video the pipeline's timestamp is the PTS itself.
+                reportRallies(pipeline.process(frame, timestampUs, timestampUs,
+                        frameExtractor.lastRange(), displayMat), videoUri);
+                sink.onDisplayFrame(displayMat);
+                return clock.waitFor(timestampUs);
+            });
+
+            // The last rally is only confirmed once the clip is over. A
+            // stopped clip tells no one about it.
+            if (isCurrent(clip)) {
+                completed = true;
+                reportRallies(pipeline.finish(), videoUri);
+            }
+        } catch (RuntimeException e) {
+            Log.e(TAG, "video playback failed", e);
+        } finally {
+            pipeline.release();
+            displayMat.release();
+            if (log != null) {
+                log.write(new Json().obj().field("type", "end")
+                        .field("frames", frames[0])
+                        .field("completed", completed).end().toString());
+                log.close();
             }
         }
-        p.release();
-        frameExtractor.close();
+    }
+
+    /** What the decoder actually delivers: size, strides, range handling and declared colour encoding. */
+    private void logStream(RunLog log) {
+        Json j = new Json().obj()
+                .field("type", "stream")
+                .field("geometry", frameExtractor.sourceGeometry())
+                .field("range_expansion", frameExtractor.isExpandingRange());
+        Formats.mediaFormat(j, "track", frameExtractor.trackFormat());
+        Formats.mediaFormat(j, "decoder_output", frameExtractor.outputFormat());
+        log.write(j.end().toString());
+    }
+
+    /** The file's name as the picker showed it, or null. */
+    private String displayName(Uri uri) {
+        try (Cursor c = appContext.getContentResolver().query(
+                uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                return c.getString(0);
+            }
+        } catch (RuntimeException e) {
+            Log.w(TAG, "could not read the video's name", e);
+        }
+        return null;
     }
 
     /** Hands each rally, with its footage range, to the listener if there is one. */
@@ -118,66 +178,42 @@ public final class VideoPlayer {
     }
 
     /**
-     * One clip's pipeline and clock. Each run() handles one frame and
-     * schedules the next.
+     * Paces playback against each frame's own presentation timestamp rather
+     * than a fixed per-frame delay. A fixed sleep is added on top of however
+     * long processing took, so the video always runs slower than real time and
+     * ignores its true frame rate.
      */
-    private final class Playback implements Runnable {
-        final Uri videoUri;
-        final FrameSink sink;
-        final FramePipeline pipeline = new FramePipeline();
-        final Mat displayMat = new Mat();
-
-        /**
-         * Paces playback against each frame's own presentation timestamp
-         * rather than a fixed per-frame delay. A fixed delay is added on top
-         * of however long processing took, so the video would always run
-         * slower than real time.
-         */
+    private final class PlaybackClock {
+        private final int clip;
         private long firstTimestampUs = -1L;
-        private long startUptimeMs = 0L;
+        private long startNs = 0L;
 
-        Playback(Uri videoUri, FrameSink sink) {
-            this.videoUri = videoUri;
-            this.sink = sink;
+        PlaybackClock(int clip) {
+            this.clip = clip;
         }
 
-        @Override
-        public void run() {
-            if (current != this) {
-                return;   // stopped after this frame was scheduled
+        /** @return false if the clip was stopped while waiting. */
+        boolean waitFor(long timestampUs) {
+            if (firstTimestampUs < 0) {
+                firstTimestampUs = timestampUs;
+                startNs = System.nanoTime();
             }
-            try {
-                Mat frame = frameExtractor.nextFrame();
-                if (frame == null) {
-                    end(true);   // end of the clip
-                    return;
-                }
-                long timestampUs = frameExtractor.timestampUs();
+            long targetMs = (timestampUs - firstTimestampUs) / 1_000L;
 
-                // For video the pipeline's timestamp is the PTS itself.
-                reportRallies(pipeline.process(frame, timestampUs, displayMat), videoUri);
-                sink.onDisplayFrame(displayMat);
-
-                // The next frame is due once this one's time has come. Behind
-                // schedule, it is due now: the video cannot speed up to catch up.
-                // Never earlier than now, or a late frame would be queued ahead
-                // of work already waiting (a stop, a save) and could starve it.
-                long nowMs = SystemClock.uptimeMillis();
-                if (firstTimestampUs < 0) {
-                    firstTimestampUs = timestampUs;
-                    startUptimeMs = nowMs;
+            // Behind schedule: no wait. The video cannot be sped up to catch up.
+            while (isCurrent(clip)) {
+                long sleepMs = targetMs - (System.nanoTime() - startNs) / 1_000_000L;
+                if (sleepMs <= 0) {
+                    return true;
                 }
-                long dueMs = startUptimeMs + (timestampUs - firstTimestampUs) / 1_000L;
-                background.handler().postAtTime(this, Math.max(dueMs, nowMs));
-            } catch (Exception e) {
-                Log.e(TAG, "video frame failed; stopping", e);
-                end(false);
+                try {
+                    Thread.sleep(Math.min(sleepMs, MAX_SLEEP_MS));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
             }
-        }
-
-        void release() {
-            pipeline.release();
-            displayMat.release();
+            return false;
         }
     }
 }

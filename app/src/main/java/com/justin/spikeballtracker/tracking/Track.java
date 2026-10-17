@@ -122,6 +122,8 @@ public final class Track {
     public long firstUs() {return t0Us;}
     public long lastUs() {return lastUs;}
     public List<Point> points() {return Collections.unmodifiableList(points);}
+    /** Whether the last shape test passed (tracks of 4+ points only). */
+    public boolean isConfirmed() {return confirmed;}
 
     public static final class Point{
         public final int frameIndex;

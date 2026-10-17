@@ -10,23 +10,14 @@ import android.media.MediaFormat;
 import android.net.Uri;
 import android.util.Log;
 
-import org.opencv.core.Core;
-import org.opencv.core.CvType;
 import org.opencv.core.Mat;
 import org.opencv.core.Size;
+
+import com.justin.spikeballtracker.log.RunLog;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
-/**
- * Decodes a video file one frame at a time into the pipeline's CV_8UC3 Y,U,V
- * format at {@link #TARGET_SIZE}.
- *
- * <p>{@link #open}, then {@link #nextFrame} until it returns null, then
- * {@link #close}. Each call does a bounded amount of work, so the caller can
- * interleave frames with other jobs on the same thread. Not thread safe: use
- * it from one thread only (the app's background thread).
- */
 public class FrameExtractor {
     private final Context context;
     private static final String TAG = "FrameExtractor";
@@ -47,111 +38,94 @@ public class FrameExtractor {
      */
     private boolean expandToFullRange = true;
 
-    // The open stream; all null/false when nothing is open.
-    private MediaExtractor extractor = null;
-    private MediaCodec codec = null;
-    private final MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
-    private boolean inputDone = false;
-    private boolean outputDone = false;
-    private long timestampUs = 0L;
+    /** The open stream's track format and the decoder's latest output format, for the run log. */
+    private MediaFormat trackFormat = null;
+    private MediaFormat outputFormat = null;
 
-    /** Channel-wise 16-235 / 16-240 to 0-255 map, built once. */
-    private final Mat fullRangeLut = buildFullRangeLut();
+    /** Range measurement and the limited-to-full expansion, shared with the camera path. */
+    private final YuvRange range = new YuvRange();
+
+    /** The last frame's range before expansion; null when not measuring. */
+    private YuvRange.Stats lastRange = null;
 
 
     public FrameExtractor(Context context) {
         this.context = context.getApplicationContext();
     }
 
+    public interface FrameListener {
+        /**
+         * Called once per decoded frame, on the thread that called
+         * {@link #streamFrames}.
+         *
+         * <p>{@code frame} is a 3-channel YUV Mat (CV_8UC3) owned by this
+         * FrameExtractor. The pixels are a copy, not a view into the decoder's
+         * buffer — but the extractor overwrites this same Mat on the next decoded
+         * frame. Do not store it, do not derive submats from it, and do not hand it
+         * to another thread. To keep the pixels beyond this call, take a
+         * {@code frame.clone()} and release the copy yourself.
+         *
+         * @param frame       current frame as CV_8UC3 YUV; valid only for this call
+         * @param timestampUs presentation timestamp, in microseconds
+         * @return true to continue decoding, false to stop
+         */
+        boolean onFrame(Mat frame, long timestampUs);
+    }
+
     /**
-     * Opens a video file and starts its decoder. Closes anything already open.
-     *
-     * @return false if the file cannot be opened or has no video track
+     * Decodes a video file and delivers every frame to the listener in order.
+     * Blocks until the video ends or the listener requests a stop.
      */
-    public boolean open(Uri videoUri) {
-        close();
+    public void streamFrames(Uri videoUri, FrameListener listener) {
+        MediaExtractor extractor = null;                                //MediaExtractor facilitates extraction of demuxed, typically encoded, media data from a data source.
+        MediaCodec codec = null;                                        //used to access low level media codecs
+
         try {
-            extractor = new MediaExtractor();                 // demuxes the file into encoded samples
+            extractor = new MediaExtractor();
             extractor.setDataSource(context, videoUri, null);
 
             int trackIndex = findVideoTrack(extractor);
             if (trackIndex < 0) {
                 Log.e(TAG, "No video track found in " + videoUri);
-                close();
-                return false;
+                return;
             }
 
             extractor.selectTrack(trackIndex);
             MediaFormat format = extractor.getTrackFormat(trackIndex);
             expandToFullRange = !isFullRange(format);
             logStreamSize(format);
+            trackFormat = new MediaFormat(format);
+            outputFormat = null;
 
-            codec = createDecoder(format);                    // low-level decoder, raw pixel output
-            inputDone = false;
-            outputDone = false;
-            return true;
-        } catch (IOException | RuntimeException e) {
+            codec = createDecoder(format);
+            decodeLoop(extractor, codec, listener);
+
+        } catch (IOException e) {
             Log.e(TAG, "Could not open video " + videoUri, e);
-            close();
-            return false;
+        } finally {
+            release(codec, extractor);
+            yuvBuilder.release();
         }
     }
 
-    /**
-     * Decodes until the next frame is ready.
-     *
-     * <p>The returned Mat is owned by this FrameExtractor and overwritten by
-     * the next call. The pixels are a copy, not a view into the decoder's
-     * buffer. Do not keep it; take a {@code clone()} to keep the pixels.
-     *
-     * @return the frame as CV_8UC3 Y,U,V at {@link #TARGET_SIZE}, or null at
-     *         the end of the stream or when nothing is open
-     */
-    public Mat nextFrame() {
-        while (codec != null && !outputDone) {
-            if (!inputDone) {
-                inputDone = feedInput(extractor, codec);
-            }
-
-            int outIndex = codec.dequeueOutputBuffer(bufferInfo, BUFFER_TIMEOUT_US);
-            if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                // Carries the real output size, crop and strides; YuvFrameBuilder
-                // reads the same from each Image, this is for the log.
-                Log.i(TAG, "decoder output format " + codec.getOutputFormat());
-            } else if (outIndex >= 0) {
-                Mat frame = null;
-                if (bufferInfo.size > 0) {
-                    Image image = codec.getOutputImage(outIndex);
-                    if (image != null) {
-                        frame = buildFrame(image);
-                        image.close();
-                    }
-                }
-                codec.releaseOutputBuffer(outIndex, false);
-
-                if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                    outputDone = true;
-                }
-                if (frame != null) {
-                    timestampUs = bufferInfo.presentationTimeUs;
-                    return frame;
-                }
-            }
-        }
-        return null;
+    /** The current stream's track format as read from the file; null before the first stream. */
+    public MediaFormat trackFormat() {
+        return trackFormat;
     }
 
-    /** Presentation timestamp of the frame last returned by {@link #nextFrame}, in microseconds. */
-    public long timestampUs() {
-        return timestampUs;
+    /** The decoder's latest reported output format; null until it reports one. */
+    public MediaFormat outputFormat() {
+        return outputFormat;
     }
 
-    /** Stops and frees the decoder and the per-stream buffers. Safe to call when nothing is open. */
-    public void close() {
-        release(codec, extractor);
-        codec = null;
-        extractor = null;
-        yuvBuilder.release();
+    /** Whether the current stream's samples are being expanded from limited to full range. */
+    public boolean isExpandingRange() {
+        return expandToFullRange;
+    }
+
+    /** The decoded frames' size, crop and strides, as {@link YuvFrameBuilder} saw them. */
+    public String sourceGeometry() {
+        return yuvBuilder.geometry();
     }
 
     /**
@@ -162,36 +136,6 @@ public class FrameExtractor {
     private static boolean isFullRange(MediaFormat format) {
         return format.containsKey(MediaFormat.KEY_COLOR_RANGE)
                 && format.getInteger(MediaFormat.KEY_COLOR_RANGE) == MediaFormat.COLOR_RANGE_FULL;
-    }
-
-    /**
-     * Builds the lookup table that maps limited-range samples to full range.
-     *
-     * <p>Luma and chroma use different conventions: luma occupies 16-235 and
-     * expands about its floor, chroma occupies 16-240 and expands about its
-     * neutral point of 128. A single 3-channel LUT applies both in one pass,
-     * which is far cheaper per frame than splitting and merging channels.
-     *
-     * @return a 1x256 CV_8UC3 table, channels in Y, U, V order
-     */
-    private static Mat buildFullRangeLut() {
-        Mat lut = new Mat(1, 256, CvType.CV_8UC3);
-        byte[] table = new byte[256 * 3];
-
-        for (int i = 0; i < 256; i++) {
-            int y = clampByte((int) Math.round((i - 16) * 255.0 / 219.0));
-            int c = clampByte((int) Math.round((i - 128) * 255.0 / 224.0 + 128));
-            table[i * 3] = (byte) y;
-            table[i * 3 + 1] = (byte) c;
-            table[i * 3 + 2] = (byte) c;
-        }
-
-        lut.put(0, 0, table);
-        return lut;
-    }
-
-    private static int clampByte(int v) {
-        return v < 0 ? 0 : (v > 255 ? 255 : v);
     }
 
     /** Returns the index of the first video track, or -1 if there is none. */
@@ -260,6 +204,49 @@ public class FrameExtractor {
     }
 
     /**
+     * Pumps encoded samples into the decoder and pulls decoded frames out until
+     * the stream ends or the listener returns false.
+     */
+    private void decodeLoop(MediaExtractor extractor, MediaCodec codec, FrameListener listener) {
+        MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+        boolean inputDone = false;
+        boolean outputDone = false;
+
+        while (!outputDone) {
+            if (!inputDone) {
+                inputDone = feedInput(extractor, codec);
+            }
+
+            int outIndex = codec.dequeueOutputBuffer(bufferInfo, BUFFER_TIMEOUT_US);
+            if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                // Carries the real output size, crop and strides; YuvFrameBuilder
+                // reads the same from each Image, this is for the log.
+                outputFormat = codec.getOutputFormat();
+                Log.i(TAG, "decoder output format " + outputFormat);
+            } else if (outIndex >= 0) {
+                Mat frame = null;
+                if (bufferInfo.size > 0) {
+                    Image image = codec.getOutputImage(outIndex);
+                    if (image != null) {
+                        frame = buildFrame(image);
+                        image.close();
+                    }
+                }
+                codec.releaseOutputBuffer(outIndex, false);
+
+                if (frame != null
+                        && !listener.onFrame(frame, bufferInfo.presentationTimeUs)) {
+                    return;
+                }
+
+                if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                    outputDone = true;
+                }
+            }
+        }
+    }
+
+    /**
      * Queues one encoded sample into the decoder.
      * @return true once the end of the stream has been signaled
      */
@@ -303,15 +290,26 @@ public class FrameExtractor {
      */
     private Mat buildFrame(Image image) {
         Mat yuv = yuvBuilder.build(image, TARGET_SIZE);
+        lastRange = RunLog.ENABLED ? range.measure(yuv) : null;
         if (expandToFullRange) {
-            Core.LUT(yuv, fullRangeLut, yuv);
+            range.expandToFull(yuv);
         }
         return yuv;
     }
 
-    /** Closes any open stream and frees everything. Call once, when the owner is destroyed. */
+    /**
+     * The frame just delivered: its per-channel sample range at the working
+     * resolution, measured before expansion. Null when run logs are off.
+     */
+    public YuvRange.Stats lastRange() {
+        return lastRange;
+    }
+
+    /**
+     * Frees resources held for the lifetime of this extractor, as opposed to
+     * the per-stream scratch buffers. Call from the owner's onDestroy.
+     */
     public void release() {
-        close();
-        fullRangeLut.release();
+        range.release();
     }
 }

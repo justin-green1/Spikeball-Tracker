@@ -18,8 +18,8 @@ import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
-import com.justin.spikeballtracker.BackgroundThread;
 import com.justin.spikeballtracker.R;
+import com.justin.spikeballtracker.WorkerThread;
 import com.justin.spikeballtracker.record.RallyFootage;
 import com.justin.spikeballtracker.record.RallySaver;
 import com.justin.spikeballtracker.source.CameraSource;
@@ -37,9 +37,10 @@ import java.util.Locale;
  * between them, and the last-rally save. Anything that touches pixels lives
  * in a source.
  *
- * <p>Two threads: this UI thread, and one {@link BackgroundThread} shared by
- * both sources and the saver. Callbacks from them (frames, rallies, saves)
- * arrive on the background thread and post UI changes back here.
+ * <p>Threads: this UI thread, plus three {@link WorkerThread}s. This activity
+ * owns Analysis, which both sources share (only one runs at a time);
+ * ReplayBuffer owns Recorder and RallySaver owns Saver. Callbacks (frames,
+ * rallies, saves) arrive on those threads and post UI changes back here.
  */
 public class MainActivity extends AppCompatActivity {
 
@@ -53,7 +54,7 @@ public class MainActivity extends AppCompatActivity {
 
     private ImageView frameImageView;
     private Button saveRallyButton;
-    private BackgroundThread background;
+    private WorkerThread analysis;
     private VideoPlayer videoPlayer;
     private CameraSource cameraSource;
     private RallySaver rallySaver;
@@ -83,10 +84,10 @@ public class MainActivity extends AppCompatActivity {
 
         frameImageView = findViewById(R.id.frame_image_view);
 
-        background = new BackgroundThread();
-        videoPlayer = new VideoPlayer(this, background);
-        cameraSource = new CameraSource(this, background);
-        rallySaver = new RallySaver(this, background);
+        analysis = new WorkerThread("Analysis");
+        videoPlayer = new VideoPlayer(this, analysis);
+        cameraSource = new CameraSource(this, analysis);
+        rallySaver = new RallySaver(this);
         videoPlayer.setRallyListener(this::onRally);
         cameraSource.setRallyListener(this::onRally);
 
@@ -126,14 +127,16 @@ public class MainActivity extends AppCompatActivity {
 
     /**
      * A source confirmed a rally: keep its footage as the last rally, and
-     * say so briefly. Called on the background thread.
+     * say so briefly. Called on Analysis (video) or Recorder (camera, once
+     * the footage is copied); everything here just posts onwards.
      */
     private void onRally(RallyDetector.Rally rally, RallyFootage footage) {
         rallySaver.keep(footage);
-        boolean canSave = rallySaver.hasRally();
         double lengthS = (rally.endUs - Math.max(0, rally.startUs)) / 1e6;
         toast(String.format(Locale.US, "Rally detected · %.1f s", lengthS));
-        runOnUiThread(() -> saveRallyButton.setEnabled(canSave));
+        if (footage != null) {
+            runOnUiThread(() -> saveRallyButton.setEnabled(true));
+        }
     }
 
     private void saveLastRally() {
@@ -161,7 +164,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * The one sink. Called on the background thread, so the Bitmap is built
+     * The one sink. Called on the Analysis thread, so the Bitmap is built
      * there and only the assignment is posted to the UI thread.
      *
      * <p>A fresh Bitmap per frame is deliberate: it crosses threads, and
@@ -184,7 +187,8 @@ public class MainActivity extends AppCompatActivity {
         stopAllSources();
         videoPlayer.release();
         cameraSource.release();
-        background.quit();   // runs the releases just posted, then stops
+        rallySaver.release();
+        analysis.quit();   // runs the releases just posted, then stops
         super.onDestroy();
     }
 }

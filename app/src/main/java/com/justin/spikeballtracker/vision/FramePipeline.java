@@ -2,10 +2,14 @@ package com.justin.spikeballtracker.vision;
 
 import android.util.Log;
 
+import com.justin.spikeballtracker.log.Json;
+import com.justin.spikeballtracker.log.RunLog;
 import com.justin.spikeballtracker.tracking.BallCandidate;
 import com.justin.spikeballtracker.tracking.BallTracker;
 import com.justin.spikeballtracker.tracking.NetZone;
 import com.justin.spikeballtracker.tracking.RallyDetector;
+import com.justin.spikeballtracker.tracking.Track;
+import com.justin.spikeballtracker.video.YuvRange;
 
 import org.opencv.core.Core;
 import org.opencv.core.Mat;
@@ -56,12 +60,38 @@ public final class FramePipeline {
     private final BallTracker     tracker         = new BallTracker();
 
     /** Replaced on a background reset, so not final. */
-    private RallyDetector rallyDetector = new RallyDetector();
+    private RallyDetector rallyDetector;
 
     // ---------------------------------------------------------------- reusable Mats
 
     private final Mat ballMask   = new Mat();
     private final Mat background = new Mat();
+    private final Mat shadowMask = new Mat();   // run log only
+
+    // ---------------------------------------------------------------- run log
+
+    /** Where every frame is described; null when not logging. */
+    private final RunLog log;
+
+    // This frame's events, for the log line.
+    private boolean resetThisFrame = false;
+    private boolean netTriedThisFrame = false;
+    private Rect netFoundThisFrame = null;
+    private final List<ScoreRow> scoresThisFrame = new ArrayList<>();
+
+    /** One frame's rally score, as it became final. */
+    private static final class ScoreRow {
+        final long frameUs;
+        final double score;
+        final boolean on;
+
+        ScoreRow(long frameUs, double score, boolean on) {
+            this.frameUs = frameUs;
+            this.score = score;
+            this.on = on;
+        }
+    }
+    private final double[] blobRow = new double[8 + BlobSvm.N_FEATURES];
 
     // ---------------------------------------------------------------- run state
 
@@ -91,17 +121,35 @@ public final class FramePipeline {
 
     // ---------------------------------------------------------------- lifecycle
 
+    /** A pipeline that logs nothing. */
+    public FramePipeline() {
+        this(null);
+    }
+
+    /** @param log where to describe every frame; null for no logging */
+    public FramePipeline(RunLog log) {
+        this.log = log;
+        this.rallyDetector = newRallyDetector();
+        svmBlobDetector.setRecording(log != null);
+    }
+
     /**
      * Runs one frame through detection, tracking and rally detection, and
      * draws the display.
      *
      * @param yuv         CV_8UC3 Y,U,V frame at the working resolution
      * @param timestampUs microseconds since this run's first frame
+     * @param sourceUs    the frame's time on its source's own clock (camera
+     *                    sensor time, or the video's PTS); only logged
+     * @param inputRange  the frame's sample range before any range expansion;
+     *                    only logged, may be null
      * @param displayOut  written with this frame in RGB, plus the net box
      * @return rallies confirmed on this frame, usually none. A rally is
      *         confirmed a few seconds after it ends, so its times are well in the past.
      */
-    public List<RallyDetector.Rally> process(Mat yuv, long timestampUs, Mat displayOut) {
+    public List<RallyDetector.Rally> process(Mat yuv, long timestampUs, long sourceUs,
+                                             YuvRange.Stats inputRange, Mat displayOut) {
+        long startNs = System.nanoTime();
         int index = frameIndex++;
         if (index == 0) {
             warmStartUs = timestampUs;
@@ -114,8 +162,9 @@ public final class FramePipeline {
         // Detection: the colour box ANDed with the motion mask (shadows kept),
         // then every blob scored by the SVM; the candidates are those at or
         // above BlobSvm.THRESHOLD.
-        Core.bitwise_and(colourDetector.processFrame(yuv),
-                motionDetector.processFrame(yuv), ballMask);
+        Mat colourMask = colourDetector.processFrame(yuv);
+        Mat motionMask = motionDetector.processFrame(yuv);
+        Core.bitwise_and(colourMask, motionMask, ballMask);
         List<BallCandidate> candidates = svmBlobDetector.findCandidates(ballMask, yuv);
 
         // Tracking.
@@ -132,7 +181,12 @@ public final class FramePipeline {
         Imgproc.cvtColor(yuv, displayOut, Imgproc.COLOR_YUV2RGB);
         drawNet(displayOut);
 
-        return drainRallies();
+        List<RallyDetector.Rally> rallies = drainRallies();
+        if (log != null) {
+            logFrame(index, timestampUs, sourceUs, (System.nanoTime() - startNs) / 1e6,
+                    inputRange, colourMask, motionMask, candidates, rallies);
+        }
+        return rallies;
     }
 
     /**
@@ -145,7 +199,15 @@ public final class FramePipeline {
     public List<RallyDetector.Rally> finish() {
         rallyDetector.finish();
         collectRallies();
-        return drainRallies();
+        List<RallyDetector.Rally> rallies = drainRallies();
+        if (log != null) {
+            Json j = new Json().obj().field("type", "finish").field("frames", frameIndex);
+            j.key("scores");
+            appendScores(j);
+            appendRallies(j, rallies);
+            log.write(j.end().toString());
+        }
+        return rallies;
     }
 
     /** Asks for a background reset, applied at the start of the next frame. Pipeline thread only. */
@@ -160,6 +222,7 @@ public final class FramePipeline {
         svmBlobDetector.release();
         ballMask.release();
         background.release();
+        shadowMask.release();
     }
 
     // ---------------------------------------------------------------- net
@@ -186,8 +249,10 @@ public final class FramePipeline {
             // Stamped before the call, so a null result or a throw costs the
             // same interval as a success.
             lastNetAttemptUs = timestampUs;
+            netTriedThisFrame = true;
 
             Rect box = netDetector.detect(background);
+            netFoundThisFrame = box;
             if (box != null) {
                 cachedNetBox = box;
                 cachedNetZone = NetZone.around(box.x, box.y, box.width, box.height);
@@ -224,6 +289,198 @@ public final class FramePipeline {
         return out;
     }
 
+    // ---------------------------------------------------------------- run log
+
+    /** A rally detector that, when logging, reports each frame's score into this frame's line. */
+    private RallyDetector newRallyDetector() {
+        RallyDetector r = new RallyDetector();
+        if (log != null) {
+            r.setScoreListener((frameUs, score, on) ->
+                    scoresThisFrame.add(new ScoreRow(frameUs, score, on)));
+        }
+        return r;
+    }
+
+    /**
+     * One {@code frame} line. Column layouts are given in the run header
+     * written by the caller; see {@link #describeColumns}.
+     */
+    private void logFrame(int index, long tUs, long sourceUs, double ms, YuvRange.Stats inputRange,
+                          Mat colourMask, Mat motionMask,
+                          List<BallCandidate> candidates, List<RallyDetector.Rally> rallies) {
+        int moving = Core.countNonZero(motionMask);
+        Core.inRange(motionMask, new Scalar(127), new Scalar(127), shadowMask);
+        int shadow = Core.countNonZero(shadowMask);
+
+        Json j = new Json().obj()
+                .field("type", "frame")
+                .field("f", index)
+                .field("t", tUs)
+                .field("src", sourceUs)
+                .field("ms", ms, 2);
+        if (inputRange != null) {
+            String[] names = {"in_y", "in_u", "in_v"};
+            for (int c = 0; c < 3; c++) {
+                j.key(names[c]).arr();
+                for (int v : inputRange.channel[c]) {
+                    j.num(v);
+                }
+                j.endArr();
+            }
+        }
+        j.field("motion", moving - shadow)
+                .field("shadow", shadow)
+                .field("colour", Core.countNonZero(colourMask))
+                .field("ball_px", Core.countNonZero(ballMask))
+                .field("components", svmBlobDetector.lastComponents())
+                .field("in_range", svmBlobDetector.lastInRange())
+                .field("static", svmBlobDetector.lastStatic());
+
+        j.key("blobs").arr();
+        for (int b = 0; b < svmBlobDetector.lastScored(); b++) {
+            svmBlobDetector.lastScoredBlob(b, blobRow);
+            j.arr();
+            j.num(blobRow[0], 2).num(blobRow[1], 2);
+            for (int k = 2; k <= 6; k++) {
+                j.num((long) blobRow[k]);
+            }
+            j.num(blobRow[7], 4);
+            for (int k = 8; k < blobRow.length; k++) {
+                j.num(blobRow[k], 4);
+            }
+            j.endArr();
+        }
+        j.endArr();
+
+        j.key("cand").arr();
+        for (BallCandidate c : candidates) {
+            j.arr().num(c.x, 2).num(c.y, 2).num(c.pBall, 4).endArr();
+        }
+        j.endArr();
+
+        int seeds = 0, stubs2 = 0, stubs3 = 0;
+        j.key("tracks").arr();
+        for (Track t : tracker.tracks()) {
+            int n = t.size();
+            if (n == 1) { seeds++; continue; }
+            if (n == 2) { stubs2++; continue; }
+            if (n == 3) { stubs3++; continue; }
+            Track.Point last = t.points().get(n - 1);
+            Track.Shape s = t.shape();
+            j.arr().num(n).bool(t.isConfirmed())
+                    .num(t.points().get(0).frameIndex).num(last.frameIndex)
+                    .num(last.x, 2).num(last.y, 2)
+                    .num(s.rms, 3).num(s.curvature, 1).num(s.span, 1).num(s.speed, 1)
+                    .endArr();
+        }
+        j.endArr();
+        j.field("seeds", seeds).field("stubs2", stubs2).field("stubs3", stubs3);
+
+        BallTracker.Output out = tracker.latest();
+        j.key("out");
+        if (out == null) {
+            j.nul();
+        } else {
+            j.arr().num(out.frameIndex).num(out.tUs).bool(out.hasBall)
+                    .num(out.x, 2).num(out.y, 2).endArr();
+        }
+
+        j.key("scores");
+        appendScores(j);
+
+        j.key("net");
+        appendRect(j, cachedNetBox);
+        if (netTriedThisFrame) {
+            j.key("net_try");
+            appendRect(j, netFoundThisFrame);
+        }
+        if (resetThisFrame) {
+            j.field("reset", true);
+        }
+        appendRallies(j, rallies);
+        log.write(j.end().toString());
+
+        netTriedThisFrame = false;
+        netFoundThisFrame = null;
+        resetThisFrame = false;
+    }
+
+    /** The scores that became final since the last line, as [frameUs, score, on] rows; then clears them. */
+    private void appendScores(Json j) {
+        j.arr();
+        for (ScoreRow r : scoresThisFrame) {
+            j.arr().num(r.frameUs).num(r.score, 4).bool(r.on).endArr();
+        }
+        j.endArr();
+        scoresThisFrame.clear();
+    }
+
+    private void appendRallies(Json j, List<RallyDetector.Rally> rallies) {
+        if (rallies.isEmpty()) {
+            return;
+        }
+        j.key("rallies").arr();
+        for (RallyDetector.Rally r : rallies) {
+            j.arr().num(r.startUs).num(r.endUs).endArr();
+        }
+        j.endArr();
+    }
+
+    private static void appendRect(Json j, Rect r) {
+        if (r == null) {
+            j.nul();
+        } else {
+            j.arr().num(r.x).num(r.y).num(r.width).num(r.height).endArr();
+        }
+    }
+
+    /**
+     * The start of a run's header line: source, log name, start time and the
+     * column layouts. The caller adds its own fields, then {@code end()}s it.
+     */
+    public static Json header(String source, RunLog log) {
+        String started = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+                java.util.Locale.US).format(new java.util.Date());
+        Json j = new Json().obj()
+                .field("type", "run")
+                .field("source", source)
+                .field("log", log.name())
+                .field("started", started)
+                .field("wall_ms", System.currentTimeMillis());
+        describeColumns(j);
+        return j;
+    }
+
+    /**
+     * Column names for the arrays in a {@code frame} line, for the run
+     * header, so a reader does not have to know this code.
+     */
+    public static void describeColumns(Json j) {
+        j.key("blob_cols").arr().str("x").str("y").str("area").str("left").str("top")
+                .str("w").str("h").str("p");
+        for (String f : BlobSvm.FEATURES) {
+            j.str(f);
+        }
+        j.endArr();
+        j.key("cand_cols").arr().str("x").str("y").str("p").endArr();
+        j.key("track_cols").arr().str("points").str("confirmed").str("first_f").str("last_f")
+                .str("x").str("y").str("rms").str("curvature").str("span").str("speed").endArr();
+        j.key("out_cols").arr().str("f").str("t").str("has_ball").str("x").str("y").endArr();
+        j.key("score_cols").arr().str("frame_t").str("score").str("rally_on").endArr();
+        j.key("rect_cols").arr().str("x").str("y").str("w").str("h").endArr();
+        j.key("range_cols").arr().str("min").str("p1").str("p99").str("max")
+                .str("below_nominal").str("above_nominal").endArr();
+        j.field("range_note", "in_y/in_u/in_v: the input frame at the working resolution, before any"
+                + " range expansion; nominal range Y " + YuvRange.LUMA_LO + "-" + YuvRange.LUMA_HI
+                + ", U/V " + YuvRange.CHROMA_LO + "-" + YuvRange.CHROMA_HI);
+        j.field("svm_threshold", BlobSvm.THRESHOLD, 3);
+        j.key("box_lo").arr().num((long) ColourDetector.LO.val[0]).num((long) ColourDetector.LO.val[1])
+                .num((long) ColourDetector.LO.val[2]).endArr();
+        j.key("box_hi").arr().num((long) ColourDetector.HI.val[0]).num((long) ColourDetector.HI.val[1])
+                .num((long) ColourDetector.HI.val[2]).endArr();
+        j.field("tracker_delay_frames", BallTracker.DELAY);
+    }
+
     // ---------------------------------------------------------------- reset
 
     /** Clears every model that describes the old framing; called on the pipeline thread. */
@@ -232,7 +489,8 @@ public final class FramePipeline {
         // with this frame's result.
         rallyDetector.finish();
         collectRallies();
-        rallyDetector = new RallyDetector();
+        rallyDetector = newRallyDetector();
+        resetThisFrame = true;
         ralliesReported = 0;
 
         motionDetector.reset();

@@ -108,6 +108,14 @@ public final class YuvFrameBuilder {
         return yuvMat;
     }
 
+    /**
+     * The last source's size, crop and plane strides, as logged; null before
+     * the first frame. Kept across {@link #release()}.
+     */
+    public String geometry() {
+        return lastGeometry;
+    }
+
     public void release() {
         yResized.release();
         uResized.release();

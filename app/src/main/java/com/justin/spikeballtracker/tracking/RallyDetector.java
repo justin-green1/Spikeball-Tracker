@@ -73,6 +73,22 @@ public class RallyDetector {
         }
     }
 
+    /** Told each frame's score as it becomes final, for the run log. */
+    public interface ScoreListener {
+        /**
+         * @param frameUs the scored frame's time; scores lag the newest frame by a few seconds
+         * @param score   half the ball share plus half the net-cover share over the window, 0-1
+         * @param on      whether a rally is open after this frame
+         */
+        void onScore(long frameUs, double score, boolean on);
+    }
+
+    private ScoreListener scoreListener = null;
+
+    public void setScoreListener(ScoreListener listener) {
+        scoreListener = listener;
+    }
+
     public static class Rally{
         public final long startUs, endUs;
 
@@ -247,6 +263,7 @@ public class RallyDetector {
             pendingEnd = lastOn;
         }
         if(on) lastOn = i;
+        if(scoreListener != null) scoreListener.onScore(f.tUs, s, on);
     }
 
     private void finalisePending(){

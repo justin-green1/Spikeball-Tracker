@@ -331,6 +331,11 @@ public class BallTracker {
         return latest;
     }
 
+    /** The seeds, stubs and tracks alive after the last frame; read-only, valid until the next process(). */
+    public List<Track> tracks() {
+        return java.util.Collections.unmodifiableList(tracks);
+    }
+
     public void reset(){
         tracks.clear();
         java.util.Arrays.fill(slotFrame, -1);

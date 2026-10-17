@@ -20,7 +20,7 @@ import java.nio.ByteBuffer;
  *
  * <p>Deliberately free of Android types so it can be unit-tested on a plain JVM.
  * Not thread safe: the writer (encoder callbacks) and the reader (copying out
- * one rally) both run on the app's one background thread.
+ * one rally) both run on ReplayBuffer's Recorder thread.
  */
 public final class EncodedRing {
 
